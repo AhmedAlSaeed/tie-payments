@@ -23,7 +23,7 @@ const AUTH_SCHEMA = readFileSync(
 export interface TestDb {
   db: Surreal;
   database: string;
-  close(): Promise<void>;
+  close(): Promise<void | boolean>;
 }
 
 export async function isSurrealAvailable(): Promise<boolean> {
