@@ -72,6 +72,31 @@ _Avoid_: VAT certificate, tax ID number
 An amount or percent reductions the charge. Line-level discounts apply before
 the invoice-wide reduction; a line marked non-discountable is excluded from both.
 
+### Subscriptions
+
+**Subscription**:
+A recurring billing agreement against a customer's payment method or an email-
+sent invoice; the root aggregate of Pillar 3. Owns items (prices) and the billing
+cycle anchors.
+_Avoid_: Plan, recurring mandate
+
+**Price**:
+A configured sellable with a `billing_scheme` (per_unit / metered / tiered) and
+a recurrence `interval` + `interval_count`. The unit a subscription item points at.
+_Avoid_: SKU, tariff
+
+**Billing cycle anchor**:
+The point (typically the subscription's start) the recurring periods are pinned
+to — each `current_period_start/end` rolls from it.
+
+**Proration**:
+The mid-cycle credit/charge produced when a plan or quantity changes before the
+period ends; credited against the customer's credit balance.
+
+**Dunning**:
+The automatic retry loop for a failed recurring charge (payment method classified
+retryable or not) escalating to `past_due` and finally auto-cancelling.
+
 ### Gateway & money
 
 **Payment**:
