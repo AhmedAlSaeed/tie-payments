@@ -97,6 +97,16 @@ _Avoid_: token, credential string
 **Onboarding**: The under-60-second flow: Better Auth signup auto-provisions a merchant, `sk_test`/`pk_test` keys, a default mock routing rule, and the 1-line SDK snippet.
 _Avoid_: provisioning, signup setup
 
+### Customization & schema engine
+
+**Field schema**: A merchant-defined [JSON Schema 2020-12] definition for custom fields on a target entity (e.g. `invoice`), stored per `(merchant, environment, target_entity)`. The SDK renders form inputs from it. Values live in each aggregate's `metadata` object.
+_Avoid_: JSONB column, EAV model
+
+**UI extensions**: The per-field hints riding alongside the raw JSON Schema (`label`, `placeholder`, `helper`, `choices`, `disabled`, `locale`) that let SDKs render inputs without guessing.
+
+**Theme**: Per-merchant render branding (colors, radius, dark/light, CSS, logo, locale) served to the hosted payment page when it ships.
+_Avoid_: Storefront, skin
+
 ### Subscriptions
 
 **Subscription**:
