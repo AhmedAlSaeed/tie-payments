@@ -1,0 +1,10 @@
+{
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  "lineWidth": 110,
+  "indentStyle": "space",
+  "indentSize": 2,
+  "semi": true,
+  "quotes": "single",
+  "trailingComma": "all",
+  "ignorePatterns": []
+}

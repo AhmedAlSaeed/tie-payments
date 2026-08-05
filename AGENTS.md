@@ -41,7 +41,7 @@ Installed globally in `~/.agents/skills/` (auto-loaded), most relevant: `elysiaj
 
 Configured in `opencode.json`:
 
-- **surrealdb** — SurrealDB built-in MCP (stdio, embedded memory DB). Needs `surreal` binary v3.1+ on PATH (install from surrealdb.com/install).
+- **surrealdb** — SurrealDB MCP over the dockerized server's HTTP `/mcp` endpoint (`http://127.0.0.1:8000/mcp`, Basic auth from `SURREALDB_BASIC_AUTH` env / `.env`). Server runs via `docker compose up -d` (see `docker-compose.yml`). Requires Docker Desktop running.
 - **stripe** — Stripe official remote MCP (`https://mcp.stripe.com`).
 
 ## Wayfinder

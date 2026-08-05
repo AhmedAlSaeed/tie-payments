@@ -1,0 +1,32 @@
+{
+  "$schema": "https://oxc-project.github.io/json-schema/oxlintrc.json",
+  "plugins": ["typescript", "unicorn"],
+  "categories": {
+    "correctness": "error",
+    "perf": "error",
+    "suspicious": "error"
+  },
+  "rules": {
+    "typescript/no-unused-vars": "error"
+  },
+  "overrides": [
+    {
+      "files": ["**/*.ts"],
+      "rules": {
+        "typescript/parameter-properties": "off",
+        "eslint/no-magic-numbers": "off",
+        "eslint/no-ternary": "off",
+        "eslint/sort-keys": "off",
+        "eslint/sort-imports": "off",
+        "eslint/id-length": "off",
+        "eslint/curly": "off",
+        "eslint/func-style": "off",
+        "eslint/prefer-named-capture-group": "off",
+        "eslint/prefer-destructuring": "off",
+        "unicorn/custom-error-definition": "off",
+        "unicorn/catch-error-name": "off",
+        "unicorn/prefer-export-from": "off"
+      }
+    }
+  ]
+}
