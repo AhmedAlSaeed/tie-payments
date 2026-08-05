@@ -20,6 +20,11 @@ Single-context. `CONTEXT.md` at root. See `docs/agents/domain.md`.
 - Not part of the `tie` monorepo. Stack: Bun + ElysiaJS + SurrealDB (modular monolith, minimal deps).
 - Seed spec: `SPEC.md`.
 
+## Hard conventions
+
+- **Never use Python** — not for scripts, tooling, JSON parsing, or anything. Use Bun/TypeScript or `jq` instead. This is a hard rule, no exceptions.
+- **Stacked PRs for big features** — use `gh stack` (GitHub CLI extension, skill in `.agents/skills/gh-stack/`) to split large changes into a chain of small reviewable PRs. Never open one giant PR. Each branch maps to one PR based on the branch below it.
+
 ## Specialized agents
 
 Project subagents in `.opencode/agent/` — delegate to the right one for the domain:
