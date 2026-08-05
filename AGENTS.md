@@ -24,6 +24,7 @@ Single-context. `CONTEXT.md` at root. See `docs/agents/domain.md`.
 
 - **Never use Python** — not for scripts, tooling, JSON parsing, or anything. Use Bun/TypeScript or `jq` instead. This is a hard rule, no exceptions.
 - **Stacked PRs for big features** — use `gh stack` (GitHub CLI extension, skill in `.agents/skills/gh-stack/`) to split large changes into a chain of small reviewable PRs. Never open one giant PR. Each branch maps to one PR based on the branch below it.
+- **Push + close on every finished ticket** — whenever a ticket/issue/map item is resolved, end the session with: (1) `git add` the local mirrors + artifacts and `git commit` + `git push`; (2) close the GitHub issue with a `## Resolution` comment (`gh issue close <n> --comment "..."`); (3) append the one-line decision to the map issue's `## Decisions so far` body (keep the GitHub map in sync with `.scratch/wayfinder/map/map.md`). Never leave a resolved item only in local files.
 
 ## Specialized agents
 
