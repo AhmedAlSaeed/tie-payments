@@ -2,13 +2,14 @@
  * Payments service — business logic for the payments pillar.
  *
  * Deliberately Elysia-free: receives a plain request context, returns typed
- * results or throws ProblemError. This is the seam where T03 (gateway
- * abstraction) plugs in: `createPayment` currently records a payment and
- * returns `requires_action`; the gateway driver dispatch is stubbed until T03.
+ * results or throws ProblemError. Gateway dispatch goes through the T03
+ * abstraction (core/gateway): a driver is routed by currency/method rules,
+ * invoked, and its normalized outcome maps onto the payment resource.
  */
 import { problem } from "../../core/errors";
 import type { Money } from "../../shared/constants";
 import type { MerchantContext } from "../../core/context";
+import type { GatewayDriver } from "../../core/gateway";
 import type { CreatePayment, PaymentResource } from "./model";
 
 export interface PaymentServiceDeps {
@@ -23,6 +24,10 @@ export interface PaymentRecord {
   amountMinor: number;
   currency: string;
   status: PaymentResource["status"];
+  /** Next action the caller must perform (redirect URL, QR code, …). */
+  action?: PaymentResource["action"];
+  /** Gateway reference for confirm/capture/refund later. */
+  providerReference?: string;
   createdAt: string;
   idempotencyKey?: string;
 }
@@ -33,10 +38,24 @@ export class PaymentService {
   async createPayment(
     ctx: MerchantContext,
     body: CreatePayment,
+    gateway: GatewayDriver,
     idempotencyKey?: string,
   ): Promise<PaymentResource> {
     const money: Money = { amountMinor: body.amountMinor, currency: body.currency };
     this.assertUsableMoney(money);
+
+    const result = await gateway.createPayment(
+      {
+        amountMinor: money.amountMinor,
+        currency: money.currency,
+        environment: ctx.environment,
+        captureMode: "automatic",
+        method: body.method,
+        description: body.description,
+        metadata: body.metadata,
+      },
+      money,
+    );
 
     const record: PaymentRecord = {
       id: `pay_${crypto.randomUUID()}`,
@@ -44,8 +63,9 @@ export class PaymentService {
       environment: ctx.environment,
       amountMinor: body.amountMinor,
       currency: body.currency,
-      // T03: dispatch to gateway driver → requires_action for 3DS, else succeeded.
-      status: "requires_action",
+      status: result.status,
+      action: result.action,
+      providerReference: result.providerReference,
       createdAt: new Date().toISOString(),
       idempotencyKey,
     };
@@ -70,6 +90,8 @@ export class PaymentService {
       status: r.status,
       amountMinor: r.amountMinor,
       currency: r.currency,
+      action: r.action,
+      providerReference: r.providerReference,
       created: r.createdAt,
       environment: r.environment,
       idempotencyKey: r.idempotencyKey,

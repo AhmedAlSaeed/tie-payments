@@ -4,22 +4,61 @@
  * Registers `/payments` routes under the versioned router's `/v1` prefix.
  * Named instance so Elysia's plugin dedup runs it once even if mounted in
  * multiple scopes (app + future test harness share the module instance).
+ *
+ * Routing (T03-smart-routing): a per-request switch selects the gateway
+ * driver from the T03 registry by currency/method/amount rules; the mock is
+ * the sandbox default. The chosen driver is passed to the PaymentService so
+ * the service stays Elysia- and registry-free.
  */
 import { Elysia, t } from "elysia";
 import { auth } from "../../core/context";
 import { InMemoryIdempotencyStore, namespaceIdempotencyKey, problem } from "../../core/idempotency";
+import {
+  defaultRegistry,
+  defaultSandboxRules,
+  type GatewayDriver,
+  matchRule,
+  MockGatewayDriver,
+  resolveDriver,
+} from "../../core/gateway";
 import { CreatePayment, PaymentResource } from "./model";
 import { PaymentService } from "./service";
 
 const store = new InMemoryIdempotencyStore();
+// T03: driver assembly at boot. Sandbox pre-activates the mock (SPEC 4.2),
+// so a fresh tenant gets working payments with no external credentials.
+defaultRegistry.register(new MockGatewayDriver());
 const service = new PaymentService({
-  insert: async (payment) => {
-    // T001: persist to SurrealDB here; prototype keeps the record in memory.
-    return payment;
-  },
+  insert: async (payment) => payment,
 });
 
+/** Route to a gateway driver for a request, defaulting to the sandbox mock. */
+export function routeDriver(
+  environment: "test" | "live",
+  currency: string,
+  amountMinor: number,
+  method?: string,
+): GatewayDriver {
+  // TODO(T05/T08): when per-merchant routing rules are DB-backed, load them
+  // here instead of the sandbox default set.
+  const id = matchRule(defaultSandboxRules, {
+    environment,
+    currency,
+    amountMinor,
+    method,
+    drivers: defaultRegistry.list(),
+  });
+  const driver =
+    (id ? resolveDriver(id, defaultRegistry) : undefined) ??
+    defaultRegistry.defaultFor(environment);
+  if (!driver) {
+    throw problem("gateway_error", `No gateway driver configured for ${environment} environment.`);
+  }
+  return driver;
+}
+
 export const payments = new Elysia({ name: "modules.payments", prefix: "/payments" })
+  .state("paymentStore", store)
   .use(auth)
   .post(
     "/",
@@ -54,9 +93,12 @@ export const payments = new Elysia({ name: "modules.payments", prefix: "/payment
         }
       }
 
+      // Choose the gateway driver for this request (T03 smart-routing).
+      const gateway = routeDriver(environment, body.currency, body.amountMinor, body.method);
       const resource = await service.createPayment(
         { merchantId, environment, role, scopes, traceId },
         body,
+        gateway,
         rawKey,
       );
 
