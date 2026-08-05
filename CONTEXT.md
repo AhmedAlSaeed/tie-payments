@@ -85,6 +85,18 @@ _Avoid_: Message queue
 **Webhook endpoint**: A merchant destination allow-listed to event types, with an HMAC signing secret. Deliveries carry `tie-timestamp` / `tie-signature`.
 **Dead-letter**: A delivery that exhausted its retry attempts, marked failed rather than silently dropped.
 
+### Sandbox & environment
+
+**API key**: A `pk_/sk_` credential whose prefix encodes the environment (`sk_test_...`). Env is always derived from the prefix and bound via the `api_key` record; raw secrets are never stored, only hashed.
+_Avoid_: token, credential string
+
+**Test/live partitioning**: Row-level DB `PERMISSIONS` scoping every table by `merchant` + `environment`, so a test key can never read live rows and vice versa.
+
+**Mock gateway**: The sandbox-default driver (`mock`) implementing the full test-card matrix — 4242 success, 0002 decline, 9999 timeout, 3D01 3DS challenge, QR BenefitPay "Simulate Scan & Pay" — with no real HTTP.
+
+**Onboarding**: The under-60-second flow: Better Auth signup auto-provisions a merchant, `sk_test`/`pk_test` keys, a default mock routing rule, and the 1-line SDK snippet.
+_Avoid_: provisioning, signup setup
+
 ### Subscriptions
 
 **Subscription**:
