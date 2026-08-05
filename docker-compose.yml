@@ -1,0 +1,21 @@
+services:
+  surrealdb:
+    image: surrealdb/surrealdb:latest
+    container_name: tie-payments-surrealdb
+    restart: unless-stopped
+    user: root
+    command: >
+      start
+      --user ${SURREALDB_USER:-root}
+      --pass ${SURREALDB_PASS:-root}
+      --bind 0.0.0.0:8000
+      rocksdb:/data/surrealdb.db
+    ports:
+      - "8000:8000"
+    volumes:
+      - surrealdb-data:/data
+    environment:
+      SURREAL_MCP_ALLOW_ALL_HOSTS: "true"
+
+volumes:
+  surrealdb-data:

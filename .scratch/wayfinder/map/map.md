@@ -27,15 +27,15 @@ A buildable, phased implementation plan (engineering spec) for the tie-payments 
 
 - [SurrealDB modeling for the payments domain](.scratch/wayfinder/tickets/01-surrealdb-modeling.md) — SCHEMAFULL + DEFINE FIELD for entities, `object FLEXIBLE` for payload bags; custom fields via indexed metadata paths; per-table `merchant`+`environment` composite indexes + `PERMISSIONS WHERE merchant`; money = `decimal`; explicit `BEGIN/COMMIT TRANSACTION` for money moves; state machines enforced in the Bun domain layer; idempotency = composite UNIQUE key + outbox rows written in-transaction; `:ulid()` record IDs.
 - [Gateway landscape: which drivers for v1](.scratch/wayfinder/tickets/02-gateway-landscape.md) — v1 driver set: Mock (sandbox default), **Tap** (primary, Bahrain), **Stripe** (global), **Moyasar** (KSA); stretch Checkout.com. Jaywan + direct BENEFIT are NOT drivers (UAE scheme / ISO 20022 rail). Abstraction seams: createPayment→action, tokenize (client-side), auth/capture/refund/void, webhook→event. Currency exponent carried (BHD=3 decimals). Mock matrix mapped to real cards.
+- [API surface & modular monolith](.scratch/wayfinder/tickets/04-api-surface.md) — monolith: `core/` shared kernel + `modules/<pillar>/` plugins, in-process comms via service imports, persistence behind store interfaces. API: `sk|pk_<test|live>_<40hex>` keys; env always derived from prefix; `Bearer` auth; `Idempotency-Key` namespaced (replay vs 409 conflict); RFC 9457 `{type,title,status,detail,code,instance}`; `/v1` versioning (major = second router mount). **Elysia 2.0-beta**: route signature `get/post(path, hook, fn)` (NOT 1.x path,fn,hook); `.error(Class, fn)` + `instanceof` discrimination (no `code` on context); a `headers` schema replaces `context.headers` so read `authorization` via `request.headers`. Deps: `elysia@next` + `typebox` only.
 
 ## Not yet specified
 
 - **Deployment/infra**: Bun hosting model, SurrealDB hosting (managed vs self), CI/CD, environments. Not sharp enough to ticket until the monolith + API surface are shaped.
-- **Security detail**: PCI SAQ-A attestation process, PDPL data-processing agreement, API-key rotation/lifecycle policy. Depends on API-surface decision.
+- **Security detail**: PCI SAQ-A attestation process, PDPL data-processing agreement, API-key rotation/lifecycle policy. Key namespacing/derived env settled in T04; rotation policy remains.
 - **HPP & theme contract**: how merchant branding/theme config surfaces through the API into hosted pages; localization/RTL contract. Depends on customization-engine decision.
 - **Smart-routing rule model**: how routing rules are expressed/evaluated (which inputs, precedence, failover semantics). Depends on gateway-abstraction decision.
-- **Idempotency & API versioning policy**: persistence + key semantics; versioning strategy. Depends on API-surface decision.
-- **Error taxonomy**: unified API error model across pillars. Depends on API-surface decision.
+- **Rate limiting**: token-bucket vs sliding window, key scope, 429 semantics. Follows on from the API-surface decisions.
 
 ## Out of scope
 

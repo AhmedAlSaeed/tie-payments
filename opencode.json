@@ -1,19 +1,25 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "instructions": ["AGENTS.md"],
+  "instructions": [
+    "AGENTS.md"
+  ],
   "mcp": {
     "surrealdb": {
-      "type": "local",
-      "command": ["surreal", "mcp", "--ns", "tie_payments", "--db", "main", "memory"],
+      "type": "remote",
+      "url": "http://127.0.0.1:8000/mcp",
       "enabled": true,
-      "environment": {
-        "SURREAL_USER": "root",
-        "SURREAL_PASS": "root"
+      "headers": {
+        "Authorization": "Basic {env:SURREALDB_BASIC_AUTH}"
       }
     },
     "stripe": {
       "type": "remote",
       "url": "https://mcp.stripe.com",
+      "enabled": true
+    },
+    "better-auth": {
+      "type": "remote",
+      "url": "https://mcp.better-auth.com/mcp",
       "enabled": true
     }
   }
