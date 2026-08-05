@@ -1,0 +1,22 @@
+diff --git a/dist/index.js b/dist/index.js
+index f050fc47a6ebe06eff7aba47637de9520e9ce3a0..4673192c3500266097615840da690dae162a737b 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -5091,7 +5091,7 @@ var RecordId = class RecordId2 extends Value {
+     return this.#id;
+   }
+ };
+-var _RecordId = RecordId;
++var _RecordId = createRequire(import.meta.url)("surrealdb").RecordId;
+ var RecordIdRange = class RecordIdRange2 extends Value {
+   #table;
+   #beg;
+@@ -9689,7 +9689,7 @@ function isTableNotFoundError(err) {
+ function deserializeValue(val) {
+   if (val instanceof _RecordId)
+     return String(val.id);
+-  if (val instanceof DateTime)
++  if (typeof val?.toDate === "function")
+     return val.toDate();
+   return val;
+ }
