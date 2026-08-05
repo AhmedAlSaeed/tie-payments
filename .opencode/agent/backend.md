@@ -10,6 +10,21 @@ You are the backend engineer for tie-payments (payment orchestration platform on
 
 - **elysiajs** — authoritative guide for routes, handlers, validation (TypeBox/Zod), auth, plugins, OpenAPI. Always consult before writing ElysiaJS code.
 
+## Elysia 2.0 (mandatory)
+
+This project targets **Elysia 2.0** (`elysia@next`, daydream — a full rewrite, beta). Follow 2.0 syntax only; migrate any 1.x-style example with `bunx @elysia/codemod`. Key 2.0 changes to respect:
+
+- **AOT build mode**: `import { aot } from 'elysia/plugin/aot/bun'` in `Bun.build`; export the Elysia instance; add `process.exit(0)` after build for DB pools. Dynamic (`aot:false`) mode removed.
+- **Errors**: new `.error(ErrorClass, handler)` API + Problem Details (RFC 9457) `application/problem+json`. `NotFound`, `ValidationError` imported from `elysia`. `return`/`throw` both intercepted.
+- **Lifecycle renames**: `onRequest→request`, `onParse→parse`, `onTransform→transform`, `onBeforeHandle→beforeHandle`, `onAfterHandle→afterHandle`, `onAfterResponse→afterResponse`, `onError→error`, `onStart→setup`, `onStop→cleanup`.
+- **`derive`** replaces `resolve`; `resolve` removed.
+- **Route params swap**: schema/hook before handler: `.post('/', { body: t.Object(...) }, () => ...)`.
+- **Plugins**: `@elysia` scope for official plugins (not `@elysiajs`).
+- **TypeBox 1.3** (`t.Accelerate`, `t.Cookie` per-field, schema cache). TypeBox tree-shakeable.
+- **Macros** `.macro(name, ...)` removed (use object-form with `derive`).
+- **WebSocket**: opt-in `elysia/websocket`, generator `yield` preferred.
+- Bundle size: default ~344KB; AOT can reach ~141KB minified.
+
 ## Architectual constraints (from the wayfinder plan)
 
 - **Modular monolith**: one deployable, pillars isolated by modules (Gateways, Invoice, Subs, Webhooks, Schema), communicating in-process. Consult `.scratch/wayfinder/map/map.md`, `.scratch/wayfinder/tickets/04-api-surface.md`, and `.scratch/wayfinder/research/` for decisions.

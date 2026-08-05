@@ -13,12 +13,13 @@ A buildable, phased implementation plan (engineering spec) for the tie-payments 
 ## Notes
 
 - **Domain**: Payment orchestration / TSP. GCC + Bahrain regulatory posture (CBB PS-1.1.3, PCI SAQ A via client-side tokenization, PDPL, VAT 5%). See `SPEC.md`.
-- **Stack fixed**: Bun runtime, ElysiaJS framework, SurrealDB. Minimal deps is a hard constraint — **every** dependency choice must be justified in the ticket's resolution (what it buys, what breaks without it, what it costs).
+- **Stack fixed**: Bun runtime (latest, `1.3.x`), ElysiaJS framework, SurrealDB. Minimal deps is a hard constraint — **every** dependency choice must be justified in the ticket's resolution (what it buys, what breaks without it, what it costs).
+- **Elysia 2.0** (daydream, full rewrite, still beta): target `elysia@next` for the plan; AOT build-mode compilation, `@elysia/` scoped plugins, new error API (Problem Details RFC 9457), `derive` replaces `resolve`, lifecycle renames (`onError→error`). See blog `elysiajs.com/blog/elysia-20.html`; migrate legacy examples with `bunx @elysia/codemod`. Backend agent + `elysiajs` skill must follow 2.0 syntax.
 - **Skills to consult**: `elysiajs` for backend patterns; `find-docs`/`ctx7` for library facts; `grilling` + `domain-modeling` for design tickets.
 - **Tooling (project setup)**: specialized subagents in `.opencode/agent/` — `db-ops` (SurrealDB), `backend` (ElysiaJS/Bun), `payments-gcc` (GCC/payments domain). Skills installed globally in `~/.agents/skills/` (surrealdb/agent-skills set, elysiajs, stripe-best-practices). MCP: `surrealdb` (built-in stdio MCP, needs `surreal` binary v3.1+ on PATH) and `stripe` (remote mcp.stripe.com). See `AGENTS.md`. Sessions must delegate to the matching subagent and use the matching skill.
 - **Scope**: core platform only. SDKs, ecosystem plugins, merchant Admin UI are **out of scope**.
 - **Delivery**: phased milestones (sandbox+mock → invoicing → subs → webhooks → schema/theme).
-- **Tracker**: local-markdown. See `docs/agents/issue-tracker.md` "Wayfinding operations".
+- **Tracker**: GitHub issues in `AhmedAlSaeed/tie-payments` (this repo). Map = issue #1 (label `wayfinder:map`); tickets = sub-issues; blocking = native GitHub issue deps. Local mirrors under `.scratch/wayfinder/`. See `docs/agents/issue-tracker.md` "Wayfinding operations".
 
 ## Decisions so far
 

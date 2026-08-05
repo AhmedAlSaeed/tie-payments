@@ -1,0 +1,74 @@
+[
+  {
+    "file": ".scratch/wayfinder/tickets\\01-surrealdb-modeling.md",
+    "title": "T01 \u2014 SurrealDB modeling for the payments domain",
+    "body": "## Question\n\nHow should the core payment domain (merchants, customers, payment methods/tokens, transactions, invoices, subscriptions, webhook events, custom-field metadata) be modeled in SurrealDB, given the whole-platform scope and the schema-engine (Pillar 5) requirement of JSONB-style extensible metadata?\n\n## What we need to know\n\n- Table/schema design for each core entity \u2014 SurrealDB table definitions, fields, indexes, and record-link vs foreign-key patterns.\n- How to model the dynamic-schema / custom-fields requirement (EAV/JSONB equivalent) in SurrealDB \u2014 flexible schemas, `OBJECT`/`FLEXIBLE` types, path queries, indexing of dynamic fields.\n- Multi-tenant isolation (per-merchant data) and the test/live environment partitioning requirement \u2014 how to scope queries strictly by environment.\n- Transactions and consistency guarantees (money-moving writes, invoice state transitions) in SurrealDB \u2014 does it support the guarantees the state machine needs?\n- Enumerations / state machines (invoice lifecycle, subscription status) \u2014 SurrealDB enum support or convention.\n- Record versioning / idempotency keys for webhooks.\n\nResolved by a research subagent reading SurrealDB docs. Findings recorded here; assets (a draft schema sketch) linked, not pasted.\n\n## Resolution\n\nResearch complete. Asset: `.scratch/wayfinder/research/T01-surrealdb-modeling.md`.\n\nKey findings:\n- **SCHEMAFULL + `DEFINE FIELD`** for business entities; SCHEMALESS / `object FLEXIBLE` only for payload bags (webhook/token payloads).\n- **Custom-fields engine**: `metadata object FLEXIBLE` = no-migration arbitrary KV; fast lookup needs a named `DEFINE INDEX` per filterable path (no auto-index). Pre-index hot keys (po_number) or use an EAV side table for unlimited arbitrary fields.\n- **Tenancy + env**: shared-schema with `merchant` + `environment` on every table, composite UNIQUE indexes including both, `PERMISSIONS WHERE merchant = $auth.merchant`; optionally split test/live into separate physical databases.\n- **Atomicity**: multi-statement writes atomic only inside explicit `BEGIN/COMMIT TRANSACTION` in one request; money-moving flows (ledger + invoice status + outbox) always wrapped. Money = `decimal`, never float.\n- **State machines**: no native enum; `string` + `ASSERT` gates values; transition legality (draft\u2192paid) lives in Bun/Elysia domain layer.\n- **Idempotency/outbox**: composite UNIQUE `(merchant, environment, idempotency_key)` + `UPSERT`; write `webhook_delivery` rows in same transaction as the domain change; dispatch on `(status, next_retry_at)`.\n- **Relational pragmatics**: denormalize hot read fields, `:ulid()` sortable record IDs, no `->>` operator \u2014 adopt `.`/`.?` idiom access as platform convention.",
+    "id": "research-surrealdb",
+    "type": "research",
+    "blocked_by": "[]"
+  },
+  {
+    "file": ".scratch/wayfinder/tickets\\02-gateway-landscape.md",
+    "title": "T02 \u2014 Gateway landscape: which drivers for v1",
+    "body": "## Question\n\nWhich payment gateways should the v1 driver set cover, and what does the real API surface of each candidate look like \u2014 so the unified abstraction (Pillar 1) and the mock-gateway matrix (section 4.3 of SPEC.md) can be designed against facts, not assumptions?\n\n## What we need to know\n\n- For each candidate (BENEFIT/BenefitPay, Jaywan, Tap, Moyasar, HyperPay, PayTabs, Stripe, Checkout.com, Adyen): sandbox availability, auth model, charge/tokenize/refund endpoints, webhook formats, 3DS support, and whether it realistically fits a v1 GCC-focused launch.\n- How diverse the payloads actually are \u2014 where the abstraction seams should be.\n- Mock-gateway realism: which of the SPEC.md test scenarios (4242 success, 0002 insufficient, 9999 timeout, 3D01 3DS, BenefitPay QR Fawri+) map to real gateway behaviors.\n\nResolved by a research subagent. Findings recorded here; a comparison table linked as an asset.\n\n## Resolution\n\nResearch complete. Asset: `.scratch/wayfinder/research/T02-gateway-landscape.md`.\n\nKey findings:\n- **Recommended v1 driver set**: Mock Gateway (default, sandbox), **Tap** (primary \u2014 native BenefitPay `src_bh.benefit`, Benefit cards, BHD), **Stripe** (global cards, best sandbox/webhook tooling), **Moyasar** (KSA mada/STC Pay, cleanest client-side tokenization). Stretch: **Checkout.com** (direct BenefitPay QR + Benefit PG + BHD). Defer: PayTabs, HyperPay, Adyen.\n- **Not drivers**: **Jaywan** (UAE card scheme / BIN range, not a PSP \u2014 no API/sandbox; model as a BIN routing rule), **direct BENEFIT** (Fawri+ is ISO 20022 rail, no merchant-facing API \u2014 reached via Tap/Checkout.com).\n- **Abstraction seams**: \u2460 `createPayment \u2192 action` (`{status, action: redirect|qr|client_secret|hosted_page}` \u2014 ~80% of driver code); \u2461 `tokenize` (client-side, publishable-key, hosted-fields; raw PAN disabled by default \u2192 SAQ A); \u2462 `authorize/capture/refund/void` (sale-vs-auth split, refund shape); \u2463 `webhook \u2192 event` (per-driver verify \u2014 raw-body HMAC vs in-payload HMAC vs unsigned+refetch; keep raw body).\n- **Currency exponent gotcha**: BHD = 3 decimals (fils) vs 2-decimal AED/SAR \u2014 abstraction must carry a currency exponent, never hardcode \u00d7100.\n- **Mock matrix mapping**: 4242/3D01 + BenefitPay QR map cleanly to Stripe/Checkout.com test cards; \"0002\" is a generic decline (real insufficient = Stripe 9995/code 51); \"9999\" is a gateway timeout, not a card.",
+    "id": "research-gateways",
+    "type": "research",
+    "blocked_by": "[]"
+  },
+  {
+    "file": ".scratch/wayfinder/tickets\\03-gateway-abstraction.md",
+    "title": "T03 \u2014 Unified gateway abstraction contract",
+    "body": "## Question\n\nWhat is the exact shape of the unified gateway driver abstraction (Pillar 1) \u2014 the interface every driver (mock, Stripe, Tap, BENEFIT\u2026) implements, the normalized request/response payloads, the routing-rule inputs, and the cross-gateway tokenization mapping?\n\n## Context\n\nBlocked by T02 (gateway landscape facts) and T01 (SurrealDB modeling, for the unified token record). Resolution should raise fidelity with a concrete artifact: a TypeScript driver interface + one normalized payload schema + a worked routing-rule sketch.\n\n## Deliverable\n\nA prototype artifact (interface + schema + routing sketch) linked as an asset, plus the decision on:\n- driver interface methods and error contract\n- normalized charge/tokenize/refund/webhook payload shape\n- routing rule inputs and evaluation semantics\n- cross-gateway token record mapping",
+    "id": "gateway-abstraction",
+    "type": "prototype",
+    "blocked_by": "[research-gateways, research-surrealdb]"
+  },
+  {
+    "file": ".scratch/wayfinder/tickets\\04-api-surface.md",
+    "title": "T04 \u2014 API surface & modular monolith layout",
+    "body": "## Question\n\nWhat does the public REST API surface look like (endpoints, versioning, auth/API-key model, environment partitioning, idempotency) and how is the modular monolith laid out on Bun + ElysiaJS so the five pillars stay decoupled inside one deployable?\n\n## Deliverables\n\n- Modular monolith layout: module boundaries, shared kernel (what's shared vs per-pillar), how pillars communicate in-process.\n- API design: `pk_test_/sk_test_` key namespacing, auth, environment enum enforced per request, idempotency-key semantics, error taxonomy, versioning policy.\n- ElysiaJS plugin/controller structure \u2014 justified against the minimal-deps constraint (is Elysia's plugin system enough, or do we need extra deps?).\n\nRaise fidelity with a prototype: ElysiaJS app skeleton + route map + one worked endpoint end-to-end.",
+    "id": "api-surface",
+    "type": "prototype",
+    "blocked_by": "[]"
+  },
+  {
+    "file": ".scratch/wayfinder/tickets\\05-invoice-engine.md",
+    "title": "T05 \u2014 Invoice engine state machine & VAT",
+    "body": "## Question\n\nWhat is the exact invoice engine design (Pillar 2): the enforced lifecycle state machine (draft \u2192 issued \u2192 partially_paid \u2192 paid \u2192 voided / overdue), line-item/tax/discount/multi-currency rules, Bahrain 5% VAT + TIN itemization, and the HPP/payment-link flow that drives state transitions?\n\n## Deliverables\n\n- Invoice state machine: states, legal transitions, who can trigger each, what events they emit.\n- Line-item model: unit amounts, quantity, VAT 5% + VAT-inclusive/exclusive handling, percentage/flat discounts, currency conversion.\n- HPP + payment-link flow: session creation, hosted page lifecycle, how payment outcome moves the invoice state.\n- Draft SurrealDB schema for invoices (aligned with T01).",
+    "id": "invoice-engine",
+    "type": "prototype",
+    "blocked_by": "[research-surrealdb]"
+  },
+  {
+    "file": ".scratch/wayfinder/tickets\\06-subscription-engine.md",
+    "title": "T06 \u2014 Subscription & recurring billing engine",
+    "body": "## Question\n\nWhat is the subscription engine design (Pillar 3): schedule modeling (daily/weekly/monthly/annual/custom cron), pricing models (flat, seat-based, usage/metered, tiered), and the smart-dunning retry flow before cancellation?\n\n## Deliverables\n\n- Subscription schedule model and recurrence calculation.\n- Pricing model representation for each of the four types \u2014 including how usage/metered events are reported and billed.\n- Dunning: retry schedules, failure escalation, cancellation triggers, integration with the invoice engine and webhook engine.\n- Draft SurrealDB schema (aligned with T01).",
+    "id": "subscription-engine",
+    "type": "grilling",
+    "blocked_by": "[invoice-engine]"
+  },
+  {
+    "file": ".scratch/wayfinder/tickets\\07-webhook-engine.md",
+    "title": "T07 \u2014 Event bus & webhook dispatch engine",
+    "body": "## Question\n\nWhat is the event bus + webhook dispatch design (Pillar 4): the canonical event model (payment.succeeded, invoice.payment_failed, subscription.canceled\u2026), gateway-webhook normalization, HMAC-SHA256 signing, exponential backoff retries, idempotency verification, and replay capability \u2014 all within the minimal-deps constraint on Bun + SurrealDB?\n\n## Deliverables\n\n- Canonical event taxonomy and schema.\n- Gateway webhook \u2192 platform event normalization mapping.\n- Delivery pipeline: signing, retries/backoff, dead-lettering, idempotency keys, replay API.\n- Whether an in-process event bus (vs a message broker dependency) satisfies the requirement \u2014 justify against minimal deps.\n- Departure surface for the (out-of-scope, API-only) admin webhook log streamer.",
+    "id": "webhook-engine",
+    "type": "grilling",
+    "blocked_by": "[api-surface]"
+  },
+  {
+    "file": ".scratch/wayfinder/tickets\\08-sandbox.md",
+    "title": "T08 \u2014 Sandbox, mock gateway & testing environment",
+    "body": "## Question\n\nWhat is the sandbox/testing environment design (section 4 of SPEC.md): dual-environment data partitioning (test/live API keys, `environment` enum, zero-leak isolation), the under-60-seconds onboarding flow, and the mock gateway driver with the full test-card matrix including the BenefitPay QR \"Simulate Scan & Pay\"?\n\n## Deliverables\n\n- Env partitioning mechanics: key generation, `environment` enum enforcement in every query, isolation guarantees.\n- Onboarding flow: signup \u2192 auto-generate sk_test \u2192 pre-activated mock driver \u2192 1-line SDK snippet \u2192 simulated payments + admin log stream reveal.\n- Mock gateway driver: implements the T03 abstraction, produces the SPEC section 4.3 matrix (4242/0002/9999/3D01/BenefitPay QR), drives webhook emission for the admin streamer.\n- Draft schema (aligned with T01).",
+    "id": "sandbox",
+    "type": "prototype",
+    "blocked_by": "[gateway-abstraction]"
+  },
+  {
+    "file": ".scratch/wayfinder/tickets\\09-schema-engine.md",
+    "title": "T09 \u2014 Dynamic schema engine & SDK auto-render",
+    "body": "## Question\n\nWhat is the dynamic customization & schema engine design (Pillar 5): the schema-driven custom-field model on core entities (invoice example in SPEC section 3.2), storage/querying in SurrealDB (JSONB/EAV equivalent), and the schema-driven form-generation contract that the SDK auto-renders from?\n\n## Deliverables\n\n- Custom-field model: JSON schema definition format, target entities, validation, storage, indexed querying.\n- How merchant-defined schemas live per-tenant and interact with the `environment` isolation.\n- The rendering contract (schema \u2192 form inputs) that browsers/SDK render \u2014 exact format so it's SDK-ready even though SDK ships later.\n- Note the theme/branding/config API surface (what the API-only admin exposes), aligned with T04.",
+    "id": "schema-engine",
+    "type": "prototype",
+    "blocked_by": "[research-surrealdb, api-surface]"
+  }
+]
