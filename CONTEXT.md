@@ -72,6 +72,19 @@ _Avoid_: VAT certificate, tax ID number
 An amount or percent reductions the charge. Line-level discounts apply before
 the invoice-wide reduction; a line marked non-discountable is excluded from both.
 
+### Events & webhooks
+
+**Canonical event**: A first-class domain event (e.g. `invoice.paid`, `subscription.canceled`) that the webhook API exposes to merchants. The only event source — gateway webhooks are normalized away before reaching the surface.
+_Avoid_: Gateway payload, raw webhook
+
+**Event envelope**: Stripe's v1 shape `{ id, type, api_version, created_at, data: { object_type, object_id, object } }` where `object` is the full snapshot of the changed aggregate.
+
+**Outbox**: The SurrealDB table written in the same transaction as a domain state change (T01 pattern); a worker drains it to emit canonical events and schedule deliveries. Gives a replayable event log with no separate broker.
+_Avoid_: Message queue
+
+**Webhook endpoint**: A merchant destination allow-listed to event types, with an HMAC signing secret. Deliveries carry `tie-timestamp` / `tie-signature`.
+**Dead-letter**: A delivery that exhausted its retry attempts, marked failed rather than silently dropped.
+
 ### Subscriptions
 
 **Subscription**:
