@@ -1,0 +1,84 @@
+# tie-payments — Shared Context
+
+Payment orchestration, invoicing and billing platform for Bahrain/GCC: a modular
+monolith (Bun + ElysiaJS + SurrealDB) that routes money through gateway drivers,
+issues and collects invoices, runs subscriptions, and delivers signed webhooks.
+
+## Language
+
+### Invoicing
+
+**Invoice**:
+A statement of amounts owed by a customer, generated one-off or from a
+subscription. The root aggregate of Pillar 2.
+_Avoid_: Bill, payment request, statement-of-charge
+
+**Line item**:
+An individual accountable charge on an invoice, carrying its own quantity, unit
+price, subtotal, discounts and tax.
+_Avoid_: Charge, SKU line
+
+**Finalization**:
+The one-way `draft → open` transition that freezes an invoice's amounts and
+assigns its number and issue date. After finalization the shipped totals are shelf-stable.
+_Avoid_: Issue, send, publish
+
+**Draft**:
+The mutable, pre-finalization invoice state. Only drafts may be edited or deleted.
+**Open**:
+A finalized invoice awaiting full payment. The only normal state from which an
+invoice can still be paid.
+**Paid**:
+An invoice whose recorded `amount_paid` equals its `amount_due`. Terminal.
+**Voided**:
+An invoice the merchant reversed/cancelled after finalization. Terminal.
+**Uncollectible**:
+An open invoice the merchant has given up collecting (kept as a debt, not
+cancelled). Terminal.
+_Avoid_: Bad debt, write-off
+
+**Overdue**:
+A *derived* indicator — an `open` invoice with a due date in the past and a
+nonzero remaining balance. Not a stored status.
+**Partial**:
+A *derived* indicator — an `open` invoice that has received some but not all of
+its money. Not a stored status.
+
+**Due date**:
+The moment an `open` invoice becomes `overdue`. Applies to the
+`send_invoice` collection method only.
+**Credit balance**:
+Money a customer overpaid; automatically credited against and applied to the
+next invoice. Where `amount_overpaid` goes.
+_Avoid_: Store credit, prepayment
+
+**Collection method**:
+How an invoice's money is obtained. `send_invoice` (the hosted page / payment
+link) or `charge_automatically` (a saved card / customer payment method).
+**Hosted payment page (HPP)**:
+The white-labelled page a customer is sent to pay a finalized invoice — its URL
+is `hosted_invoice_url`. The human-shared copy of it is a **payment link**.
+
+**Tax rate**:
+A configured percentage/% or flat charge with an explicit inclusive/exclusive
+behaviour and jurisdiction. Bahrain's default is 5% VAT. The invoice engine applies
+configured rates; it does not auto-discover tax.
+**TIN (Taxpayer Identification Number)**:
+The merchant's tax registration number, printed on the invoice; required for
+Bahrain VAT (NBR).
+_Avoid_: VAT certificate, tax ID number
+
+**Discount**:
+An amount or percent reductions the charge. Line-level discounts apply before
+the invoice-wide reduction; a line marked non-discountable is excluded from both.
+
+### Gateway & money
+
+**Payment**:
+A discrete charge performed through a gateway, optionally linked to an invoice.
+**Money**:
+An amount in that currency's smallest unit (minor units) plus an ISO-4217
+currency code. Always integer minor units, never float.
+**Currency**:
+An invoices is strictly one currency; all its lines and payments are that
+currency. There is no currency conversion in the engine.
