@@ -5,20 +5,14 @@
  * idempotent), so dev data is never touched. `isSurrealAvailable` lets suites
  * `skipIf` when the dockerized server isn't running.
  */
-import { readFileSync } from "node:fs";
 import { Surreal } from "surrealdb";
-import { envDbConfig } from "../../src/core/db";
+import { applySchema, envDbConfig } from "../../src/core/db";
 
 export const TEST_NAMESPACE = envDbConfig().namespace;
 
 export function testDatabaseName(): string {
   return process.env.SURREAL_TEST_DATABASE ?? "payments_test";
 }
-
-const AUTH_SCHEMA = readFileSync(
-  new URL("../../src/auth/schema.surql", import.meta.url),
-  "utf8",
-);
 
 export interface TestDb {
   db: Surreal;
@@ -52,7 +46,7 @@ export async function createTestDb(): Promise<TestDb> {
   await db.use({ namespace: cfg.namespace });
   await db.query("DEFINE DATABASE IF NOT EXISTS $db;", { db: database });
   await db.use({ namespace: cfg.namespace, database });
-  await db.query(AUTH_SCHEMA);
+  await applySchema(db);
 
   return { db, database, close: () => db.close() };
 }

@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import {
   ApiKeyError,
   generateKey,
+  hashSecret,
   parseBearer,
   parseKey,
 } from "../../src/core/apikey";
@@ -18,6 +19,15 @@ describe("generateKey", () => {
 
   it("is unique across calls", () => {
     expect(generateKey("sk", "test")).not.toBe(generateKey("sk", "test"));
+  });
+});
+
+describe("hashSecret", () => {
+  it("produces a stable SHA-256 hex digest (never stores raw secrets)", () => {
+    const h = hashSecret("deadbeef");
+    expect(h).toMatch(/^[0-9a-f]{64}$/);
+    expect(hashSecret("deadbeef")).toBe(h);
+    expect(hashSecret("deadbeef")).not.toBe(hashSecret("deadbeeff"));
   });
 });
 

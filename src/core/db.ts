@@ -9,6 +9,7 @@
  * under the Node-based Better Auth CLI when it imports the config. Bun
  * populates process.env from the local `.env`, so runtime behaviour matches.
  */
+import { readFileSync } from "node:fs";
 import { Surreal } from "surrealdb";
 
 export interface DbConfig {
@@ -17,6 +18,20 @@ export interface DbConfig {
   database: string;
   user: string;
   pass: string;
+}
+
+/** Better Auth identity schema (user/session/account/...). */
+const AUTH_SCHEMA = readFileSync(new URL("../auth/schema.surql", import.meta.url), "utf8");
+/** Platform persistence + tenancy schema (F0 artifact). */
+const PLATFORM_SCHEMA = readFileSync(new URL("./schema.surql", import.meta.url), "utf8");
+
+/**
+ * Apply the full schema artifact idempotently (both DDL files use IF NOT EXISTS).
+ * Call once per process at bootstrap; safe to re-run.
+ */
+export async function applySchema(db: Surreal): Promise<void> {
+  await db.query(AUTH_SCHEMA);
+  await db.query(PLATFORM_SCHEMA);
 }
 
 export function envDbConfig(): DbConfig {
@@ -44,6 +59,8 @@ let db: Surreal | undefined;
 /** Process-wide singleton. Connect on first use and reuse forever. */
 export async function getDb(): Promise<Surreal> {
   if (db) return db;
-  db = await connectDb(envDbConfig());
+  const connection = await connectDb(envDbConfig());
+  await applySchema(connection);
+  db = connection;
   return db;
 }

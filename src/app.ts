@@ -13,15 +13,17 @@
 import { Elysia } from "elysia";
 import type { Surreal } from "surrealdb";
 import { errorHandling } from "./core/errors-plugin";
-import { auth } from "./core/context";
+import { createContextAuth } from "./core/context";
 import { getDb } from "./core/db";
 import { createAuth, createIdentity, createSessionAuth } from "./auth";
-import { payments } from "./modules/payments";
+import { createPaymentsModule } from "./modules/payments";
 
 export function createApp(db: Surreal) {
   const identityAuth = createAuth(db);
   const identity = createIdentity(identityAuth);
   const sessionAuth = createSessionAuth(identityAuth);
+
+  const auth = createContextAuth(db);
 
   const v1 = new Elysia({ prefix: "/v1" })
     .use(errorHandling)
@@ -33,7 +35,7 @@ export function createApp(db: Surreal) {
       scopes,
       traceId,
     }))
-    .use(payments);
+    .use(createPaymentsModule(db));
   // Pillars to land with their tickets, mounted on the same versioned router:
   //   .use(invoicing)     (T05)
   //   .use(subscriptions) (T06)

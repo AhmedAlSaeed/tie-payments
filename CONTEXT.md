@@ -90,7 +90,8 @@ _Avoid_: Message queue
 **API key**: A `pk_/sk_` credential whose prefix encodes the environment (`sk_test_...`). Env is always derived from the prefix and bound via the `api_key` record; raw secrets are never stored, only hashed.
 _Avoid_: token, credential string
 
-**Test/live partitioning**: Row-level DB `PERMISSIONS` scoping every table by `merchant` + `environment`, so a test key can never read live rows and vice versa.
+**Test/live partitioning**: Tenancy isolation so a test key can never read live rows and vice versa. Enforced in the store layer — every query is scoped by `merchant` + `environment` derived from the key (never the body). Backed by schema `PERMISSIONS WHERE merchant = $auth.merchant AND environment = $auth.environment` clauses on every table (defense-in-depth; the current SurrealDB nightly only enforces the read side reliably).
+_Avoid_: trusting a single DB-layer gate for writes on the current server build
 
 **Mock gateway**: The sandbox-default driver (`mock`) implementing the full test-card matrix — 4242 success, 0002 decline, 9999 timeout, 3D01 3DS challenge, QR BenefitPay "Simulate Scan & Pay" — with no real HTTP.
 

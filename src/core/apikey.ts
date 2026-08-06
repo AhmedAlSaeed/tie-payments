@@ -33,9 +33,9 @@ export function generateKey(type: ApiKeyType, env: Environment): string {
   return `${type}_${env}_${secret}`;
 }
 
-/** Always-hashed lookup value so raw secrets never touch the DB. */
+/** Always-hashed lookup value so raw secrets never touch the DB (SHA-256 hex). */
 export function hashSecret(raw: string): string {
-  return Bun.hash.xxHash32(raw).toString(36);
+  return new Bun.CryptoHasher("sha256").update(raw).digest("hex");
 }
 
 /** Parse+validate a raw bearer key into its typed structure, or throw ApiKeyError. */
