@@ -309,6 +309,25 @@ DEFINE FIELD IF NOT EXISTS response_status ON event_delivery TYPE option<int>;
 DEFINE FIELD IF NOT EXISTS signature      ON event_delivery TYPE string;
 DEFINE FIELD IF NOT EXISTS deadlettered_at ON event_delivery TYPE option<datetime>;
 DEFINE INDEX IF NOT EXISTS event_delivery_scope ON event_delivery FIELDS merchant, environment;
+-- At-least-once per (event, endpoint): one delivery row per pair, `attempt`
+-- increments on retry (T07 D5).
+DEFINE INDEX IF NOT EXISTS event_delivery_dedup ON event_delivery FIELDS merchant, environment, event, endpoint UNIQUE;
+
+-- ---------------------------------------------------------------------------
+-- inbound_webhook — T07 D6: seen gateway webhooks (de-dup + replay no-op).
+-- The UNIQUE (merchant, environment, driver, gateway_event_id) key makes a
+-- replayed gateway delivery a 200 no-op instead of a re-emitted event.
+-- ---------------------------------------------------------------------------
+DEFINE TABLE IF NOT EXISTS inbound_webhook SCHEMAFULL
+  PERMISSIONS FOR select, create WHERE merchant = $auth.merchant AND environment = $auth.environment;
+DEFINE FIELD IF NOT EXISTS merchant           ON inbound_webhook TYPE record<merchant>;
+DEFINE FIELD IF NOT EXISTS environment        ON inbound_webhook TYPE string ASSERT $value IN ["test", "live"];
+DEFINE FIELD IF NOT EXISTS driver             ON inbound_webhook TYPE string;
+DEFINE FIELD IF NOT EXISTS gateway_event_id   ON inbound_webhook TYPE string;
+DEFINE FIELD IF NOT EXISTS provider_reference ON inbound_webhook TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS canonical_type     ON inbound_webhook TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS created_at         ON inbound_webhook TYPE datetime DEFAULT time::now();
+DEFINE INDEX IF NOT EXISTS inbound_webhook_dedup ON inbound_webhook FIELDS merchant, environment, driver, gateway_event_id UNIQUE;
 
 DEFINE TABLE IF NOT EXISTS webhook_endpoint SCHEMAFULL
   PERMISSIONS FOR select, create, update, delete WHERE merchant = $auth.merchant AND environment = $auth.environment;
