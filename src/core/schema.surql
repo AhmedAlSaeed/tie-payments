@@ -308,10 +308,14 @@ DEFINE FIELD IF NOT EXISTS delivered_at   ON event_delivery TYPE option<datetime
 DEFINE FIELD IF NOT EXISTS response_status ON event_delivery TYPE option<int>;
 DEFINE FIELD IF NOT EXISTS signature      ON event_delivery TYPE string;
 DEFINE FIELD IF NOT EXISTS deadlettered_at ON event_delivery TYPE option<datetime>;
-DEFINE INDEX IF NOT EXISTS event_delivery_scope ON event_delivery FIELDS merchant, environment;
 -- At-least-once per (event, endpoint): one delivery row per pair, `attempt`
 -- increments on retry (T07 D5).
 DEFINE INDEX IF NOT EXISTS event_delivery_dedup ON event_delivery FIELDS merchant, environment, event, endpoint UNIQUE;
+-- Durable retry scheduling (T07 D4): when is the next attempt due? The drainer
+-- re-fires rows whose next_attempt_at has passed. NULL = due now.
+DEFINE FIELD IF NOT EXISTS next_attempt_at ON event_delivery TYPE option<datetime>;
+DEFINE INDEX IF NOT EXISTS event_delivery_scope ON event_delivery FIELDS merchant, environment;
+DEFINE INDEX IF NOT EXISTS event_delivery_due ON event_delivery FIELDS merchant, environment, next_attempt_at;
 
 -- ---------------------------------------------------------------------------
 -- inbound_webhook — T07 D6: seen gateway webhooks (de-dup + replay no-op).

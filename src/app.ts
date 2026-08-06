@@ -17,6 +17,9 @@ import { createContextAuth } from "./core/context";
 import { getDb } from "./core/db";
 import { createAuth, createIdentity, createSessionAuth } from "./auth";
 import { createPaymentsModule } from "./modules/payments";
+import { createInvoicingModule } from "./modules/invoicing";
+import { createWebhooksModule } from "./modules/webhooks";
+import { createCustomizationModule } from "./modules/customization";
 
 export function createApp(db: Surreal) {
   const identityAuth = createAuth(db);
@@ -35,12 +38,12 @@ export function createApp(db: Surreal) {
       scopes,
       traceId,
     }))
-    .use(createPaymentsModule(db));
+    .use(createPaymentsModule(db))
+    .use(createInvoicingModule(db))
+    .use(createWebhooksModule(db))
+    .use(createCustomizationModule(db));
   // Pillars to land with their tickets, mounted on the same versioned router:
-  //   .use(invoicing)     (T05)
   //   .use(subscriptions) (T06)
-  //   .use(webhooks)      (T07)
-  //   .use(schemaEngine)  (T09)
 
   // Human-facing platform surface — session-authenticated (Better Auth), NOT
   // API-key auth. Seam for the merchant portal + operator console endpoints.
