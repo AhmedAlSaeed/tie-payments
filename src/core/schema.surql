@@ -181,6 +181,8 @@ DEFINE FIELD IF NOT EXISTS due_date           ON invoice TYPE option<datetime>;
 DEFINE FIELD IF NOT EXISTS issued_at          ON invoice TYPE option<datetime>;
 DEFINE FIELD IF NOT EXISTS hosted_invoice_url ON invoice TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS invoice_pdf        ON invoice TYPE option<string>;
+-- The subscription that generated this cycle invoice (T4 dunning linkage).
+DEFINE FIELD IF NOT EXISTS subscription       ON invoice TYPE option<record<subscription>>;
 DEFINE FIELD IF NOT EXISTS line_items         ON invoice TYPE array<object> FLEXIBLE;
 DEFINE FIELD IF NOT EXISTS line_items.*.description  ON invoice TYPE string;
 DEFINE FIELD IF NOT EXISTS line_items.*.quantity     ON invoice TYPE decimal;
@@ -192,6 +194,7 @@ DEFINE FIELD IF NOT EXISTS metadata           ON invoice TYPE option<object> FLE
 DEFINE INDEX IF NOT EXISTS invoice_scope_status  ON invoice FIELDS merchant, environment, status;
 DEFINE INDEX IF NOT EXISTS invoice_scope_customer ON invoice FIELDS merchant, environment, customer;
 DEFINE INDEX IF NOT EXISTS invoice_scope_due     ON invoice FIELDS merchant, environment, due_date;
+DEFINE INDEX IF NOT EXISTS invoice_scope_subscription ON invoice FIELDS merchant, environment, subscription;
 
 -- ---------------------------------------------------------------------------
 -- invoice_tax_rate — explicit tax rates (seed BH 5% VAT); read-mostly (T05)
@@ -277,6 +280,8 @@ DEFINE TABLE IF NOT EXISTS dunning_attempt SCHEMAFULL
 DEFINE FIELD IF NOT EXISTS merchant     ON dunning_attempt TYPE record<merchant> READONLY;
 DEFINE FIELD IF NOT EXISTS environment  ON dunning_attempt TYPE string ASSERT $value IN ["test", "live"] READONLY;
 DEFINE FIELD IF NOT EXISTS subscription ON dunning_attempt TYPE record<subscription>;
+DEFINE FIELD IF NOT EXISTS invoice      ON dunning_attempt TYPE option<record<invoice>>;
+DEFINE FIELD IF NOT EXISTS method       ON dunning_attempt TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS attempt      ON dunning_attempt TYPE int DEFAULT 0;
 DEFINE FIELD IF NOT EXISTS max_attempts ON dunning_attempt TYPE int DEFAULT 3;
 DEFINE FIELD IF NOT EXISTS due_at       ON dunning_attempt TYPE datetime;
