@@ -63,10 +63,28 @@ export interface SubscriptionRow {
   currentPeriodStart: string;
   currentPeriodEnd: string;
   trialEnd?: string;
+  cancelAt?: string;
   cancelAtPeriodEnd: boolean;
+  canceledAt?: string;
   prorationBehavior: string;
+  /** Free-form optional status transition timestamps (started_at, past_due_at, …). */
+  statusTransitions?: Record<string, unknown>;
   metadata?: Record<string, string>;
   createdAt: string;
+}
+
+/** DB-mapped dunning_attempt row (surfaces invoice link + retry budget). */
+export interface DunningAttemptRow {
+  id: string;
+  merchantId: string;
+  environment: string;
+  subscriptionId: string;
+  invoiceId: string;
+  method?: string;
+  attempt: number;
+  maxAttempts: number;
+  dueAt: string;
+  state: "pending" | "past_due" | "canceled";
 }
 
 export class SubscriptionsRepository {
@@ -411,6 +429,413 @@ export class SubscriptionsRepository {
 
   // Private -------------------------------------------------------------
 
+  // ---- Dunning (T4) -----------------------------------------------------
+
+  /**
+   * Atomic "record a failed recurring charge": (1) renew-or-create the ONE
+   * active dunning attempt for the subscription (dedup — state `pending`,
+   * `attempt = 1`, `due_at = now`), (2) escalate the subscription to
+   * `past_due` (stamp `status_transitions.past_due_at`), and (3) emit
+   * `subscription.past_due` in the outbox — all in one transaction.
+   */
+  async recordFailedCharge(
+    merchantId: string,
+    environment: string,
+    subId: string,
+    dunning: { invoiceId: string; method?: string; maxAttempts: number },
+    event: OutboxEventData,
+    statusTransitions: Record<string, unknown>,
+  ): Promise<DunningAttemptRow> {
+    const existing = await this.findDunningAttempt(merchantId, environment, subId);
+    const id = existing?.id ?? `da_${crypto.randomUUID()}`;
+    const attemptStmt = existing
+      ? `UPDATE dunning_attempt SET
+           attempt = 1, state = 'pending', due_at = time::now(),
+           invoice = type::record('invoice', $invoice),
+           method = $method, max_attempts = $maxAttempts
+         WHERE id = type::record('dunning_attempt', $id)
+           AND merchant = $merchant AND environment = $environment;`
+      : `INSERT INTO dunning_attempt {
+           id: $id, merchant: $merchant, environment: $environment,
+           subscription: type::record('subscription', $subId),
+           invoice: type::record('invoice', $invoice),
+           method: $method, attempt: 1, max_attempts: $maxAttempts,
+           state: 'pending', due_at: time::now()
+         };`;
+
+    await this.db.query(
+      `BEGIN TRANSACTION;
+       ${attemptStmt}
+       UPDATE subscription SET
+         status = 'past_due',
+         status_transitions = $statusTransitions
+       WHERE id = type::record('subscription', $subId)
+         AND merchant = $merchant AND environment = $environment;
+       INSERT INTO outbox_event {
+         merchant: $merchant, environment: $environment,
+         type: $eventType, object_type: "subscription",
+         object_id: $subId, object: $eventObject, window: time::now()
+       };
+       COMMIT TRANSACTION;`,
+      {
+        id,
+        merchant: recordIdOf(merchantId),
+        environment,
+        subId,
+        invoice: dunning.invoiceId,
+        method: dunning.method ?? undefined,
+        maxAttempts: dunning.maxAttempts,
+        statusTransitions,
+        eventType: event.type,
+        eventObject: event.snapshot,
+      },
+    );
+    return {
+      id,
+      merchantId,
+      environment,
+      subscriptionId: subId,
+      invoiceId: dunning.invoiceId,
+      method: dunning.method,
+      attempt: 1,
+      maxAttempts: dunning.maxAttempts,
+      dueAt: new Date().toISOString(),
+      state: "pending",
+    };
+  }
+
+  /** Return the active `pending`/`past_due` dunning attempt for a subscription. */
+  async findDunningAttempt(
+    merchantId: string,
+    environment: string,
+    subscriptionId: string,
+  ): Promise<DunningAttemptRow | undefined> {
+    const [rows] = await this.db
+      .query(
+        `SELECT * FROM dunning_attempt
+         WHERE subscription = type::record('subscription', $sub)
+           AND merchant = $merchant AND environment = $environment
+           AND state IN ['pending', 'past_due']
+         LIMIT 1`,
+        { sub: subscriptionId, merchant: recordIdOf(merchantId), environment },
+      )
+      .collect<[Array<Record<string, unknown>>]>();
+    const row = rows?.[0];
+    return row ? mapDunningAttempt(row) : undefined;
+  }
+
+  /**
+   * Rewrite a pending attempt's schedule after a failed re-charge. Used by:
+   *  - retryable branch: increment `attempt`, push `due_at` forward by backoff,
+   *    keep `state = 'pending'`;
+   *  - non-retryable stop: set `state = 'past_due'` (terminal — the ticker only
+   *    scans `pending`, so this attempt is never re-run), keep attempt + due_at.
+   * Single-statement attempt write; the subscription state does not change.
+   */
+  async rescheduleAttempt(
+    merchantId: string,
+    environment: string,
+    id: string,
+    fields: { attempt: number; state: "pending" | "past_due" | "canceled"; dueAt?: string },
+  ): Promise<void> {
+    await this.db.query(
+      `UPDATE dunning_attempt SET
+         attempt = $attempt, state = $state
+         ${fields.dueAt ? ", due_at = $dueAt" : ""}
+       WHERE id = type::record('dunning_attempt', $id)
+         AND merchant = $merchant AND environment = $environment`,
+      {
+        merchant: recordIdOf(merchantId),
+        environment,
+        id,
+        attempt: fields.attempt,
+        state: fields.state,
+        dueAt: fields.dueAt ? new Date(fields.dueAt) : undefined,
+      },
+    );
+  }
+
+  /**
+   * Atomic auto-cancel (retry budget exhausted): mark the dunning attempt
+   * `canceled`, flip the subscription to `canceled` (`canceled_at` +
+   * `status_transitions.canceled_at`) and emit `subscription.canceled` — all in
+   * one transaction.
+   */
+  async finalizeCancel(
+    merchantId: string,
+    environment: string,
+    attemptId: string,
+    subId: string,
+    canceledAt: string,
+    event: OutboxEventData,
+    statusTransitions: Record<string, unknown>,
+  ): Promise<void> {
+    await this.db.query(
+      `BEGIN TRANSACTION;
+       UPDATE dunning_attempt SET state = 'canceled'
+       WHERE id = type::record('dunning_attempt', $attemptId)
+         AND merchant = $merchant AND environment = $environment;
+       UPDATE subscription SET
+         status = 'canceled',
+         canceled_at = $canceledAt,
+         status_transitions = $statusTransitions
+       WHERE id = type::record('subscription', $subId)
+         AND merchant = $merchant AND environment = $environment;
+       INSERT INTO outbox_event {
+         merchant: $merchant, environment: $environment,
+         type: $eventType, object_type: "subscription",
+         object_id: $subId, object: $eventObject, window: time::now()
+       };
+       COMMIT TRANSACTION;`,
+      {
+        merchant: recordIdOf(merchantId),
+        environment,
+        attemptId,
+        subId,
+        canceledAt: new Date(canceledAt),
+        statusTransitions,
+        eventType: event.type,
+        eventObject: event.snapshot,
+      },
+    );
+  }
+
+  /**
+   * Atomic success (re-charge paid the invoice): delete the attempt AND
+   * reactivate the subscription (`status = 'active'`), emitting
+   * `subscription.updated` with the reactivated snapshot.
+   */
+  async finalizeSuccess(
+    merchantId: string,
+    environment: string,
+    attemptId: string,
+    subId: string,
+    event: OutboxEventData,
+  ): Promise<void> {
+    await this.db.query(
+      `BEGIN TRANSACTION;
+       DELETE dunning_attempt
+       WHERE id = type::record('dunning_attempt', $attemptId)
+         AND merchant = $merchant AND environment = $environment;
+       UPDATE subscription SET status = 'active'
+       WHERE id = type::record('subscription', $subId)
+         AND merchant = $merchant AND environment = $environment;
+       INSERT INTO outbox_event {
+         merchant: $merchant, environment: $environment,
+         type: $eventType, object_type: "subscription",
+         object_id: $subId, object: $eventObject, window: time::now()
+       };
+       COMMIT TRANSACTION;`,
+      {
+        merchant: recordIdOf(merchantId),
+        environment,
+        attemptId,
+        subId,
+        eventType: event.type,
+        eventObject: event.snapshot,
+      },
+    );
+  }
+
+  /** Stamp `invoice.subscription` at period-close so dunning can resolve invoice→subscription. */
+  async linkSubscriptionToInvoice(
+    merchantId: string,
+    environment: string,
+    invoiceId: string,
+    subId: string,
+  ): Promise<void> {
+    await this.db.query(
+      `UPDATE invoice SET subscription = type::record('subscription', $sub)
+       WHERE id = type::record('invoice', $invoiceId)
+         AND merchant = $merchant AND environment = $environment`,
+      { merchant: recordIdOf(merchantId), environment, invoiceId, sub: subId },
+    );
+  }
+
+  /** All due `pending` attempts across every scope (for runDunningTick). */
+  async findDueDunning(nowIso: string): Promise<DunningAttemptRow[]> {
+    const [rows] = await this.db
+      .query("SELECT * FROM dunning_attempt WHERE state = 'pending' AND due_at <= $now", {
+        now: new Date(nowIso),
+      })
+      .collect<[Array<Record<string, unknown>>]>();
+    return (rows ?? []).map(mapDunningAttempt);
+  }
+
+  /**
+   * Read the most recent invoice payment outbox event (paid / payment_failed /
+   * payment_action_required) so the dunning run can classify a re-charge
+   * outcome without trusting a synchronous return value.
+   */
+  async findLatestInvoiceEvent(
+    merchantId: string,
+    environment: string,
+    invoiceId: string,
+  ): Promise<{ type: string; snapshot: Record<string, unknown> } | undefined> {
+    const [rows] = await this.db
+      .query(
+        `SELECT type, object, window FROM outbox_event
+         WHERE merchant = $merchant AND environment = $environment
+           AND object_type = 'invoice' AND object_id = $invoiceId
+           AND type IN ['invoice.paid', 'invoice.payment_failed', 'invoice.payment_action_required']
+         ORDER BY window DESC LIMIT 1`,
+        { merchant: recordIdOf(merchantId), environment, invoiceId },
+      )
+      .collect<[Array<{ type: string; object: Record<string, unknown> }>]>();
+    const row = rows?.[0];
+    return row ? { type: row.type, snapshot: row.object ?? {} } : undefined;
+  }
+
+  /** Emit `subscription.trial_will_end` once and stamp `status_transitions` (atomic). */
+  async markTrialWillEnd(
+    merchantId: string,
+    environment: string,
+    subId: string,
+    statusTransitions: Record<string, unknown>,
+    event: OutboxEventData,
+  ): Promise<void> {
+    await this.db.query(
+      `BEGIN TRANSACTION;
+       UPDATE subscription SET status_transitions = $statusTransitions
+       WHERE id = type::record('subscription', $subId)
+         AND merchant = $merchant AND environment = $environment;
+       INSERT INTO outbox_event {
+         merchant: $merchant, environment: $environment,
+         type: $eventType, object_type: "subscription",
+         object_id: $subId, object: $eventObject, window: time::now()
+       };
+       COMMIT TRANSACTION;`,
+      {
+        merchant: recordIdOf(merchantId),
+        environment,
+        subId,
+        statusTransitions,
+        eventType: event.type,
+        eventObject: event.snapshot,
+      },
+    );
+  }
+
+  /**
+   * Cancel a subscription per mode (D7):
+   *  - immediate      → status `canceled` + canceled_at + emit event
+   *  - at / at_period → scheduler fields only, no event
+   * `cancelAttempt` (immediate) also flips the active dunning attempt to
+   * `canceled`. All in one transaction.
+   */
+  async applySubscriptionCancel(
+    merchantId: string,
+    environment: string,
+    subId: string,
+    fields: {
+      status?: string;
+      canceledAt?: string;
+      cancelAt?: string;
+      cancelAtPeriodEnd?: boolean;
+      statusTransitions?: Record<string, unknown>;
+      cancelAttempt?: boolean;
+    },
+    event?: OutboxEventData,
+  ): Promise<void> {
+    const sets: string[] = [];
+    const bind: Record<string, unknown> = {
+      merchant: recordIdOf(merchantId),
+      environment,
+      subId,
+    };
+    if (fields.status) {
+      sets.push("status = $status");
+      bind["status"] = fields.status;
+    }
+    if (fields.canceledAt) {
+      sets.push("canceled_at = $canceledAt");
+      bind["canceledAt"] = new Date(fields.canceledAt);
+    }
+    if (fields.cancelAt) {
+      sets.push("cancel_at = $cancelAt");
+      bind["cancelAt"] = new Date(fields.cancelAt);
+    }
+    if (fields.cancelAtPeriodEnd !== undefined) {
+      sets.push("cancel_at_period_end = $cancelAtPeriodEnd");
+      bind["cancelAtPeriodEnd"] = fields.cancelAtPeriodEnd;
+    }
+    if (fields.statusTransitions) {
+      sets.push("status_transitions = $statusTransitions");
+      bind["statusTransitions"] = fields.statusTransitions;
+    }
+
+    const cancelAttempt = fields.cancelAttempt
+      ? `UPDATE dunning_attempt SET state = 'canceled'
+         WHERE subscription = type::record('subscription', $subId)
+           AND merchant = $merchant AND environment = $environment
+           AND state IN ['pending', 'past_due'];`
+      : "";
+    const subStmt = `UPDATE subscription SET ${sets.join(", ")}
+       WHERE id = type::record('subscription', $subId) AND merchant = $merchant AND environment = $environment;`;
+    const outbox = event
+      ? `INSERT INTO outbox_event {
+           merchant: $merchant, environment: $environment,
+           type: $eventType, object_type: "subscription",
+           object_id: $subId, object: $eventObject, window: time::now()
+         };`
+      : "";
+
+    await this.db.query(
+      `BEGIN TRANSACTION;
+       ${cancelAttempt}
+       ${subStmt}
+       ${outbox}
+       COMMIT TRANSACTION;`,
+      {
+        ...bind,
+        ...(event ? { eventType: event.type, eventObject: event.snapshot } : {}),
+      },
+    );
+  }
+
+  /**
+   * Atomic quantity change + credit balance adjustment (D6). `creditDelta` is
+   * added to the customer's stored balance (negative for an upgrade, positive
+   * for a downgrade). Emits `subscription.updated`.
+   */
+  async applyProration(
+    merchantId: string,
+    environment: string,
+    customerId: string,
+    itemId: string,
+    quantity: number,
+    creditDelta: number,
+    event: OutboxEventData,
+    subId: string,
+  ): Promise<void> {
+    await this.db.query(
+      `BEGIN TRANSACTION;
+       UPDATE subscription_item SET quantity = $quantity
+       WHERE id = type::record('subscription_item', $itemId)
+         AND merchant = $merchant AND environment = $environment;
+       UPDATE customer SET credit_balance = credit_balance + $delta
+       WHERE id = type::record('customer', $customerId)
+         AND merchant = $merchant AND environment = $environment;
+       INSERT INTO outbox_event {
+         merchant: $merchant, environment: $environment,
+         type: $eventType, object_type: "subscription",
+         object_id: $subId, object: $eventObject, window: time::now()
+       };
+       COMMIT TRANSACTION;`,
+      {
+        merchant: recordIdOf(merchantId),
+        environment,
+        customerId,
+        itemId,
+        quantity,
+        delta: creditDelta,
+        subId,
+        eventType: event.type,
+        eventObject: event.snapshot,
+      },
+    );
+  }
+
   private priceParams(p: PriceRow) {
     return {
       id: p.id,
@@ -495,10 +920,29 @@ function mapSubscription(row: Record<string, unknown>): SubscriptionRow {
     currentPeriodStart: isoDate(row.current_period_start),
     currentPeriodEnd: isoDate(row.current_period_end),
     trialEnd: row.trial_end ? isoDate(row.trial_end) : undefined,
+    cancelAt: row.cancel_at ? isoDate(row.cancel_at) : undefined,
     cancelAtPeriodEnd: Boolean(row.cancel_at_period_end),
+    canceledAt: row.canceled_at ? isoDate(row.canceled_at) : undefined,
     prorationBehavior: String(row.proration_behavior ?? "create_prorations"),
+    statusTransitions: (row.status_transitions as Record<string, unknown>) ?? undefined,
     metadata: (row.metadata as Record<string, string>) ?? undefined,
     createdAt: isoDate(row.created_at),
+  };
+}
+
+/** Map a dunning_attempt row. */
+function mapDunningAttempt(row: Record<string, unknown>): DunningAttemptRow {
+  return {
+    id: bareId(row.id),
+    merchantId: bareId(row.merchant),
+    environment: String(row.environment),
+    subscriptionId: bareId(row.subscription),
+    invoiceId: bareId(row.invoice),
+    method: (row.method as string) ?? undefined,
+    attempt: Number(row.attempt),
+    maxAttempts: Number(row.max_attempts),
+    dueAt: isoDate(row.due_at),
+    state: row.state as DunningAttemptRow["state"],
   };
 }
 

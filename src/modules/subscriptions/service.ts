@@ -23,10 +23,15 @@ import { problem } from "../../core/errors";
 import type { MerchantContext } from "../../core/context";
 import { addPeriod, computeMetered, computeTiered } from "./billing";
 import type {
+  CancelSubscription,
+  ChangeItemQuantity,
   CreatePrice,
   CreateSubscription,
   CreateUsageRecord,
   Currency,
+  DunningAttempt,
+  DunningRunResult,
+  FailedChargeResult,
   PriceResource,
   SubscriptionItemResource,
   SubscriptionResource,
@@ -34,7 +39,12 @@ import type {
   UpdateSubscription,
   UsageRecordResource,
 } from "./model";
-import type { PriceRow, SubscriptionItemRow, SubscriptionRow } from "./repository";
+import type {
+  DunningAttemptRow,
+  PriceRow,
+  SubscriptionItemRow,
+  SubscriptionRow,
+} from "./repository";
 
 /** Persistence seam (implemented by SubscriptionsRepository). */
 export interface SubscriptionsStore {
@@ -90,6 +100,87 @@ export interface SubscriptionsStore {
     startMs: number,
     endMs: number,
   ): Promise<number>;
+
+  // ---- Dunning (T4) -----------------------------------------------------
+  recordFailedCharge(
+    merchantId: string,
+    environment: string,
+    subId: string,
+    dunning: { invoiceId: string; method?: string; maxAttempts: number },
+    event: { type: string; snapshot: Record<string, unknown> },
+    statusTransitions: Record<string, unknown>,
+  ): Promise<DunningAttemptRow>;
+  findDunningAttempt(
+    merchantId: string,
+    environment: string,
+    subscriptionId: string,
+  ): Promise<DunningAttemptRow | undefined>;
+  rescheduleAttempt(
+    merchantId: string,
+    environment: string,
+    id: string,
+    fields: { attempt: number; state: "pending" | "past_due" | "canceled"; dueAt?: string },
+  ): Promise<void>;
+  finalizeCancel(
+    merchantId: string,
+    environment: string,
+    attemptId: string,
+    subId: string,
+    canceledAt: string,
+    event: { type: string; snapshot: Record<string, unknown> },
+    statusTransitions: Record<string, unknown>,
+  ): Promise<void>;
+  finalizeSuccess(
+    merchantId: string,
+    environment: string,
+    attemptId: string,
+    subId: string,
+    event: { type: string; snapshot: Record<string, unknown> },
+  ): Promise<void>;
+  linkSubscriptionToInvoice(
+    merchantId: string,
+    environment: string,
+    invoiceId: string,
+    subId: string,
+  ): Promise<void>;
+  findLatestInvoiceEvent(
+    merchantId: string,
+    environment: string,
+    invoiceId: string,
+  ): Promise<{ type: string; snapshot: Record<string, unknown> } | undefined>;
+
+  // ---- D6/D7 (proration + cancel) -------------------------------------
+  markTrialWillEnd(
+    merchantId: string,
+    environment: string,
+    subId: string,
+    statusTransitions: Record<string, unknown>,
+    event: { type: string; snapshot: Record<string, unknown> },
+  ): Promise<void>;
+  applySubscriptionCancel(
+    merchantId: string,
+    environment: string,
+    subId: string,
+    fields: {
+      status?: SubscriptionRow["status"];
+      canceledAt?: string;
+      cancelAt?: string;
+      cancelAtPeriodEnd?: boolean;
+      statusTransitions?: Record<string, unknown>;
+      cancelAttempt?: boolean;
+    },
+    event?: { type: string; snapshot: Record<string, unknown> },
+  ): Promise<void>;
+  applyProration(
+    merchantId: string,
+    environment: string,
+    customerId: string,
+    itemId: string,
+    quantity: number,
+    creditDelta: number,
+    event: { type: string; snapshot: Record<string, unknown> },
+    subId: string,
+  ): Promise<void>;
 }
 
 /** Invoicing seam (implemented by the T1 InvoiceService). */
@@ -106,6 +197,17 @@ export interface SubscriptionInvoicing {
     },
   ): Promise<{ id: string; status: string }>;
   finalize(ctx: MerchantContext, id: string): Promise<{ id: string; status: string }>;
+  /**
+   * Collect an OPEN invoice through the routed gateway (T2). On gateway
+   * decline/timeouts the invoice stays `open` and the failure is surfaced via a
+   * `invoice.payment_failed` (or `invoice.payment_action_required`) outbox event
+   * — the dunning run reads that event to branch on `retryable`.
+   */
+  charge(
+    ctx: MerchantContext,
+    id: string,
+    body: { method: string; amount?: number },
+  ): Promise<{ id: string; status: string }>;
 }
 
 export class SubscriptionService {
@@ -324,6 +426,13 @@ export class SubscriptionService {
           collection_method: sub.collectionMethod,
           line_items: lineItems,
         });
+        // T4: stamp invoice.subscription so dunning can resolve invoice → sub.
+        await this.store.linkSubscriptionToInvoice(
+          ctx.merchantId,
+          ctx.environment,
+          invoice.id,
+          sub.id,
+        );
         await this.invoicing.finalize(ctx, invoice.id);
       }
     } else if (wasTrialing) {
@@ -356,7 +465,364 @@ export class SubscriptionService {
     return resource;
   }
 
-  // Private --------------------------------------------------------------
+  // ---- Dunning (T4) ------------------------------------------------------
+
+  /**
+   * Durable hook a failed recurring charge calls (T06 D10). Dedups to ONE
+   * active dunning attempt per subscription (renewed: attempt=1, state pending,
+   * due_at=now), escalates the subscription to `past_due` and emits
+   * `subscription.past_due` — atomically in the store.
+   */
+  async recordFailedCharge(
+    ctx: MerchantContext,
+    subId: string,
+    body: { invoice_id: string; method?: string },
+  ): Promise<FailedChargeResult> {
+    const found = await this.store.findSubscription(ctx.merchantId, ctx.environment, subId);
+    if (!found) throw problem("resource_not_found", "Subscription not found.");
+    const { sub, items } = found;
+
+    const pastDue: SubscriptionRow = { ...sub, status: "past_due" };
+    const snapshot = this.toSubscriptionResource(pastDue, items);
+    const statusTransitions = {
+      ...sub.statusTransitions,
+      past_due_at: new Date().toISOString(),
+    };
+    const attempt = await this.store.recordFailedCharge(
+      ctx.merchantId,
+      ctx.environment,
+      subId,
+      {
+        invoiceId: stripPrefix(body.invoice_id, "invoice"),
+        method: body.method,
+        maxAttempts: DUNNING_MAX_ATTEMPTS,
+      },
+      { type: "subscription.past_due", snapshot },
+      statusTransitions,
+    );
+    return { subscription: snapshot, attempt: this.toDunningAttempt(subId, attempt) };
+  }
+
+  /**
+   * Process one subscription's due dunning attempt: re-charge the failed invoice
+   * with the stored method, then branch on the gateway outcome:
+   *  - paid            → clear attempt, subscription → active (`succeeded`)
+   *  - retryable fail  → attempt++; reschedule at backoff; auto-cancel past
+   *                      budget (`retry_scheduled` / `canceled`)
+   *  - non-retryable   → stop: attempt terminal `past_due`, no future due_at
+   *  - requires_action → short in-process retry (30s), attempt not burned
+   */
+  async runDunning(ctx: MerchantContext, subId: string): Promise<DunningRunResult> {
+    const found = await this.store.findSubscription(ctx.merchantId, ctx.environment, subId);
+    if (!found) throw problem("resource_not_found", "Subscription not found.");
+    const { sub, items } = found;
+
+    const attempt = await this.store.findDunningAttempt(ctx.merchantId, ctx.environment, subId);
+    const now = new Date().toISOString();
+    if (!attempt) {
+      return {
+        subscription: this.toSubscriptionResource(sub, items),
+        attempt: this.toDunningAttempt(subId, {
+          ...emptyAttempt(subId),
+          state: "canceled",
+          dueAt: now,
+        }),
+        outcome: "not_due",
+      };
+    }
+    if (Date.parse(attempt.dueAt) > Date.now()) {
+      return {
+        subscription: this.toSubscriptionResource(sub, items),
+        attempt: this.toDunningAttempt(subId, attempt),
+        outcome: "not_due",
+      };
+    }
+
+    // Re-charge the failed invoice through the T1 invoicing service (applies
+    // credit, moves amount_paid, emits invoice.paid/payment_failed).
+    const method = attempt.method;
+    if (!method) {
+      await this.store.rescheduleAttempt(ctx.merchantId, ctx.environment, attempt.id, {
+        attempt: attempt.attempt,
+        state: "past_due",
+      });
+      return {
+        subscription: this.toSubscriptionResource(sub, items),
+        attempt: this.toDunningAttempt(subId, { ...attempt, state: "past_due" }),
+        outcome: "stopped",
+      };
+    }
+
+    const invoice = await this.invoicing.charge(ctx, attempt.invoiceId, { method });
+
+    if (invoice.status === "paid") {
+      // Success — clear the attempt and reactivate.
+      const active: SubscriptionRow = { ...sub, status: "active" };
+      const snapshot = this.toSubscriptionResource(active, items);
+      await this.store.finalizeSuccess(ctx.merchantId, ctx.environment, attempt.id, subId, {
+        type: "subscription.updated",
+        snapshot,
+      });
+      return {
+        subscription: snapshot,
+        attempt: this.toDunningAttempt(subId, { ...attempt, state: "canceled" }),
+        outcome: "succeeded",
+      };
+    }
+
+    const classification = await this.classifyChargeOutcome(
+      ctx.merchantId,
+      ctx.environment,
+      attempt.invoiceId,
+    );
+
+    if (classification === "requires_action") {
+      // 3DS / QR: keep the attempt pending, short in-process retry (30s). The
+      // attempt counter is NOT burned — the payer can complete the action.
+      const dueAt = new Date(Date.now() + REQUIRES_ACTION_RETRY_MS).toISOString();
+      await this.store.rescheduleAttempt(ctx.merchantId, ctx.environment, attempt.id, {
+        attempt: attempt.attempt,
+        state: "pending",
+        dueAt,
+      });
+      return {
+        subscription: this.toSubscriptionResource(sub, items),
+        attempt: this.toDunningAttempt(subId, { ...attempt, dueAt }),
+        outcome: "requires_action",
+      };
+    }
+
+    if (classification.retryable) {
+      const nextAttempt = attempt.attempt + 1;
+      if (nextAttempt > attempt.maxAttempts) {
+        // Budget exhausted — auto-cancel.
+        const canceledAt = new Date().toISOString();
+        const canceled: SubscriptionRow = { ...sub, status: "canceled", canceledAt };
+        const snapshot = this.toSubscriptionResource(canceled, items);
+        const transitions = {
+          ...sub.statusTransitions,
+          canceled_at: canceledAt,
+        };
+        await this.store.finalizeCancel(
+          ctx.merchantId,
+          ctx.environment,
+          attempt.id,
+          subId,
+          canceledAt,
+          { type: "subscription.canceled", snapshot },
+          transitions,
+        );
+        return {
+          subscription: snapshot,
+          attempt: this.toDunningAttempt(subId, {
+            ...attempt,
+            attempt: nextAttempt,
+            state: "canceled",
+          }),
+          outcome: "canceled",
+        };
+      }
+      const dueAt = new Date(Date.now() + backoffForAttempt(nextAttempt) * 1000).toISOString();
+      await this.store.rescheduleAttempt(ctx.merchantId, ctx.environment, attempt.id, {
+        attempt: nextAttempt,
+        state: "pending",
+        dueAt,
+      });
+      return {
+        subscription: this.toSubscriptionResource(sub, items),
+        attempt: this.toDunningAttempt(subId, { ...attempt, attempt: nextAttempt, dueAt }),
+        outcome: "retry_scheduled",
+      };
+    }
+
+    // Non-retryable: stop. Subscription stays past_due; no future due_at; no
+    // auto-cancel. The attempt flips to the terminal `past_due` state so the
+    // ticker (which scans `pending`) never re-runs it.
+    await this.store.rescheduleAttempt(ctx.merchantId, ctx.environment, attempt.id, {
+      attempt: attempt.attempt,
+      state: "past_due",
+    });
+    return {
+      subscription: this.toSubscriptionResource(sub, items),
+      attempt: this.toDunningAttempt(subId, { ...attempt, state: "past_due" }),
+      outcome: "stopped",
+    };
+  }
+
+  /** Classify a failed re-charge from the invoice's payment outbox event. */
+  private async classifyChargeOutcome(
+    merchantId: string,
+    environment: string,
+    invoiceId: string,
+  ): Promise<"requires_action" | { retryable: boolean }> {
+    const ev = await this.store.findLatestInvoiceEvent(merchantId, environment, invoiceId);
+    if (!ev) return { retryable: false }; // conservative: stop.
+    const snapshot = ev.snapshot;
+    if (ev.type === "invoice.payment_action_required" || snapshot.payment_action) {
+      return "requires_action";
+    }
+    if (ev.type === "invoice.payment_failed") {
+      const failure = snapshot.payment_failure as { retryable?: boolean } | undefined;
+      return { retryable: failure?.retryable ?? false };
+    }
+    return { retryable: false };
+  }
+
+  // ---- Cancel modes (D7) -------------------------------------------------
+
+  /**
+   * Cancel a subscription:
+   *  - `immediate`     → status `canceled` + `canceled_at`, emits
+   *                      `subscription.canceled`, terminates the dunning attempt;
+   *  - `at_period_end` → `cancel_at_period_end = true` (no status change);
+   *  - `at`            → schedule `cancel_at` (no status change).
+   */
+  async cancelSubscription(
+    ctx: MerchantContext,
+    subId: string,
+    body: CancelSubscription,
+  ): Promise<SubscriptionResource> {
+    const found = await this.store.findSubscription(ctx.merchantId, ctx.environment, subId);
+    if (!found) throw problem("resource_not_found", "Subscription not found.");
+    const { sub, items } = found;
+
+    if (body.mode === "immediate") {
+      const canceledAt = new Date().toISOString();
+      const next: SubscriptionRow = { ...sub, status: "canceled", canceledAt };
+      const snapshot = this.toSubscriptionResource(next, items);
+      const transitions = { ...sub.statusTransitions, canceled_at: canceledAt };
+      await this.store.applySubscriptionCancel(
+        ctx.merchantId,
+        ctx.environment,
+        subId,
+        { status: "canceled", canceledAt, statusTransitions: transitions, cancelAttempt: true },
+        { type: "subscription.canceled", snapshot },
+      );
+      return snapshot;
+    }
+
+    if (body.mode === "at_period_end") {
+      await this.store.applySubscriptionCancel(ctx.merchantId, ctx.environment, subId, {
+        cancelAtPeriodEnd: true,
+      });
+    } else {
+      // mode === "at" — require a parseable datetime.
+      if (!body.at || !Number.isFinite(Date.parse(body.at))) {
+        throw problem("validation_error", "mode 'at' requires a parseable `at` datetime.", [
+          { field: "at", message: "required parseable datetime for mode=at" },
+        ]);
+      }
+      await this.store.applySubscriptionCancel(ctx.merchantId, ctx.environment, subId, {
+        cancelAt: body.at,
+      });
+    }
+
+    const reloaded = await this.store.findSubscription(ctx.merchantId, ctx.environment, subId);
+    return this.toSubscriptionResource(reloaded!.sub, reloaded!.items);
+  }
+
+  // ---- Proration (D6) ----------------------------------------------------
+
+  /**
+   * Change an item's quantity mid-cycle and prorate the remaining period into
+   * the customer's `credit_balance`:
+   *
+   *   prorated = round(unit_amount × (newQty − oldQty) × remainingFraction)
+   *   remainingFraction = (period_end − now) / (period_end − period_start)
+   *
+   * A negative delta (downgrade) credits the customer; a positive delta
+   * (upgrade) debits the credit balance. Emits `subscription.updated`.
+   */
+  async changeItemQuantity(
+    ctx: MerchantContext,
+    subId: string,
+    itemId: string,
+    body: ChangeItemQuantity,
+  ): Promise<SubscriptionResource> {
+    const found = await this.store.findSubscription(ctx.merchantId, ctx.environment, subId);
+    if (!found) throw problem("resource_not_found", "Subscription not found.");
+    const { sub, items } = found;
+    const item = items.find((it) => it.id === itemId);
+    if (!item) throw problem("resource_not_found", "Subscription item not found.");
+
+    const newQuantity = body.quantity;
+    if (newQuantity === item.quantity) {
+      return this.toSubscriptionResource(sub, items);
+    }
+
+    const price = await this.store.findPrice(ctx.merchantId, ctx.environment, item.priceId);
+    if (!price) throw problem("resource_not_found", "Price not found.");
+
+    const startMs = Date.parse(item.periodStart);
+    const endMs = Date.parse(item.periodEnd);
+    const totalMs = Math.max(1, endMs - startMs);
+    const remainingFraction = Math.max(0, Math.min(1, (endMs - Date.now()) / totalMs));
+    const deltaSeats = newQuantity - item.quantity;
+    const prorated = Math.round((price.unitAmount ?? 0) * deltaSeats * remainingFraction);
+    // credit_balance changes by the inverse: downgrade (negative delta) → +credit.
+    const creditDelta = -prorated;
+
+    const next: SubscriptionRow = { ...sub };
+    const nextItems = items.map((it) => (it.id === itemId ? { ...it, quantity: newQuantity } : it));
+    const snapshot = this.toSubscriptionResource(next, nextItems);
+    await this.store.applyProration(
+      ctx.merchantId,
+      ctx.environment,
+      sub.customerId,
+      itemId,
+      newQuantity,
+      creditDelta,
+      { type: "subscription.updated", snapshot },
+      sub.id,
+    );
+    return snapshot;
+  }
+
+  // ---- Trial maintenance -------------------------------------------------
+
+  /**
+   * Emit `subscription.trial_will_end` ONCE (marked in `status_transitions`) for
+   * a `trialing` subscription whose `trial_end` falls within the next 24h. A
+   * testable seam — wired to POST /:id/maintain and the monolith dunning tick.
+   */
+  async maintain(ctx: MerchantContext, subId: string): Promise<SubscriptionResource> {
+    const found = await this.store.findSubscription(ctx.merchantId, ctx.environment, subId);
+    if (!found) throw problem("resource_not_found", "Subscription not found.");
+    const { sub, items } = found;
+
+    const transitions = sub.statusTransitions ?? {};
+    const alreadySent = Boolean(transitions.trial_will_end_sent);
+    if (
+      sub.status === "trialing" &&
+      sub.trialEnd &&
+      !alreadySent &&
+      Date.parse(sub.trialEnd) <= Date.now() + TRIAL_WILL_END_WINDOW_MS
+    ) {
+      const snapshot = this.toSubscriptionResource(sub, items);
+      await this.store.markTrialWillEnd(
+        ctx.merchantId,
+        ctx.environment,
+        subId,
+        { ...transitions, trial_will_end_sent: new Date().toISOString() },
+        { type: "subscription.trial_will_end", snapshot },
+      );
+    }
+    const reloaded = await this.store.findSubscription(ctx.merchantId, ctx.environment, subId);
+    return this.toSubscriptionResource(reloaded!.sub, reloaded!.items);
+  }
+
+  private toDunningAttempt(subId: string, row: DunningAttemptRow): DunningAttempt {
+    return {
+      id: row.id,
+      subscription: `subscription:${subId}`,
+      invoice: row.invoiceId ? `invoice:${row.invoiceId}` : undefined,
+      method: row.method,
+      attempt: row.attempt,
+      max_attempts: row.maxAttempts,
+      state: row.state,
+      due_at: row.dueAt,
+    };
+  }
 
   private assertPrice(p: {
     billing_scheme: string;
@@ -481,7 +947,9 @@ export class SubscriptionService {
       current_period_start: sub.currentPeriodStart,
       current_period_end: sub.currentPeriodEnd,
       trial_end: sub.trialEnd,
+      cancel_at: sub.cancelAt,
       cancel_at_period_end: sub.cancelAtPeriodEnd,
+      canceled_at: sub.canceledAt,
       items: resItems,
       metadata: sub.metadata,
       created: sub.createdAt,
@@ -499,4 +967,39 @@ function stripPrefix(ref: string, table: string): string {
 /** Normalize a Date → ISO string (deterministic storage/readback). */
 function toIso(d: Date): string {
   return d.toISOString();
+}
+
+// ---- Dunning tuning constants ------------------------------------------
+
+/** Default retry budget per subscription (dunning_attempt.max_attempts). */
+export const DUNNING_MAX_ATTEMPTS = 3;
+
+/**
+ * Exponential backoff window (seconds) before attempt `attempt` is retried:
+ * 10s × 2^(attempt−1), capped at ~1.8h (6480s). Matches the webhooks drainer.
+ */
+export function backoffForAttempt(attempt: number): number {
+  return Math.min(10 * Math.pow(2, attempt - 1), 6480);
+}
+
+/** Short in-process retry window for a `requires_action` (3DS/QR) outcome. */
+export const REQUIRES_ACTION_RETRY_MS = 30_000;
+
+/** Window (ms) before trial_end within which `subscription.trial_will_end` fires. */
+export const TRIAL_WILL_END_WINDOW_MS = 86_400_000;
+
+/** Default (empty) attempt row rendered when no active attempt exists. */
+function emptyAttempt(subId: string): DunningAttemptRow {
+  return {
+    id: "",
+    merchantId: "",
+    environment: "",
+    subscriptionId: subId,
+    invoiceId: "",
+    method: undefined,
+    attempt: 0,
+    maxAttempts: DUNNING_MAX_ATTEMPTS,
+    dueAt: new Date().toISOString(),
+    state: "pending",
+  };
 }

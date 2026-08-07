@@ -142,7 +142,9 @@ export const SubscriptionResource = t.Object({
   current_period_start: t.String(),
   current_period_end: t.String(),
   trial_end: t.Optional(t.String()),
+  cancel_at: t.Optional(t.String()),
   cancel_at_period_end: t.Boolean(),
+  canceled_at: t.Optional(t.String()),
   items: t.Array(SubscriptionItemResource),
   metadata: t.Optional(t.Record(t.String(), t.String())),
   created: t.String(),
@@ -172,3 +174,74 @@ export const UsageRecordResource = t.Object({
   recorded_at: t.String(),
 });
 export type UsageRecordResource = Static<typeof UsageRecordResource>;
+
+/**
+ * Body for POST /v1/subscriptions/:id/dunning/on_failed_charge — the durable
+ * hook a failed recurring charge calls (T06 D10). `invoice_id` identifies the
+ * OPEN cycle invoice to re-charge; `method` is the token to retry with (defaults
+ * to the attempt's stored method on later retries).
+ */
+export const OnFailedCharge = t.Object({
+  invoice_id: t.String({ minLength: 1 }),
+  method: t.Optional(t.String()),
+});
+export type OnFailedCharge = Static<typeof OnFailedCharge>;
+
+export const DunningState = t.Union([
+  t.Literal("pending"),
+  t.Literal("past_due"),
+  t.Literal("canceled"),
+]);
+export type DunningState = Static<typeof DunningState>;
+
+/** Dunning attempt resource returned by the dunning endpoints. */
+export const DunningAttempt = t.Object({
+  id: t.String(),
+  subscription: t.String(),
+  invoice: t.Optional(t.String()),
+  method: t.Optional(t.String()),
+  attempt: t.Number(),
+  max_attempts: t.Number(),
+  state: DunningState,
+  due_at: t.String(),
+});
+export type DunningAttempt = Static<typeof DunningAttempt>;
+
+/** Outcome of a single /dunning/run pass. */
+export const DunningOutcome = t.Union([
+  t.Literal("not_due"),
+  t.Literal("succeeded"),
+  t.Literal("retry_scheduled"),
+  t.Literal("stopped"),
+  t.Literal("requires_action"),
+  t.Literal("canceled"),
+]);
+export type DunningOutcome = Static<typeof DunningOutcome>;
+
+export const DunningRunResult = t.Object({
+  subscription: SubscriptionResource,
+  attempt: DunningAttempt,
+  outcome: DunningOutcome,
+});
+export type DunningRunResult = Static<typeof DunningRunResult>;
+
+/** Body for POST /v1/subscriptions/:id/dunning/on_failed_charge response. */
+export const FailedChargeResult = t.Object({
+  subscription: SubscriptionResource,
+  attempt: DunningAttempt,
+});
+export type FailedChargeResult = Static<typeof FailedChargeResult>;
+
+/** Body for POST /v1/subscriptions/:id/cancel — three cancel modes (D7). */
+export const CancelSubscription = t.Object({
+  mode: t.Union([t.Literal("immediate"), t.Literal("at_period_end"), t.Literal("at")]),
+  /** Required when mode = "at": schedule cancellation at this datetime. */
+  at: t.Optional(t.String()),
+});
+export type CancelSubscription = Static<typeof CancelSubscription>;
+
+/** Body for POST /v1/subscriptions/:id/items/:item_id/quantity (D6 proration). */
+export const ChangeItemQuantity = t.Object({
+  quantity: t.Number({ minimum: 1, integer: true }),
+});
+export type ChangeItemQuantity = Static<typeof ChangeItemQuantity>;
