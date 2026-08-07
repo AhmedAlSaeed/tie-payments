@@ -9,7 +9,7 @@
  * under the Node-based Better Auth CLI when it imports the config. Bun
  * populates process.env from the local `.env`, so runtime behaviour matches.
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { Surreal } from "surrealdb";
 
 export interface DbConfig {
@@ -20,18 +20,23 @@ export interface DbConfig {
   pass: string;
 }
 
-/** Better Auth identity schema (user/session/account/...). */
-const AUTH_SCHEMA = readFileSync(new URL("../auth/schema.surql", import.meta.url), "utf8");
-/** Platform persistence + tenancy schema (F0 artifact). */
-const PLATFORM_SCHEMA = readFileSync(new URL("./schema.surql", import.meta.url), "utf8");
+/**
+ * Schema source of truth — managed by SurrealKit (`surrealkit sync`).
+ * Files apply in lexical order (e.g. `00_auth.surql` before `10_platform.surql`).
+ */
+const SCHEMA_DIR = new URL("../../database/schema/", import.meta.url);
 
 /**
- * Apply the full schema artifact idempotently (both DDL files use IF NOT EXISTS).
+ * Apply every schema file idempotently (all DDL uses IF NOT EXISTS).
  * Call once per process at bootstrap; safe to re-run.
  */
 export async function applySchema(db: Surreal): Promise<void> {
-  await db.query(AUTH_SCHEMA);
-  await db.query(PLATFORM_SCHEMA);
+  const files = readdirSync(SCHEMA_DIR)
+    .filter((f) => f.endsWith(".surql"))
+    .toSorted();
+  await Promise.all(
+    files.map((file) => db.query(readFileSync(new URL(file, SCHEMA_DIR), "utf8"))),
+  );
 }
 
 export function envDbConfig(): DbConfig {

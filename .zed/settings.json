@@ -1,0 +1,40 @@
+// Project settings for tie-payments — SurrealQL language server.
+//
+// Requires the "SurrealQL" Zed extension (surrealdb/surrealql-zed) to be
+// installed: `zed: extensions` → search "SurrealQL" → Install, or clone
+// https://github.com/surrealdb/surrealql-zed and run `zed: install dev
+// extension` pointing at it.
+{
+  "languages": {
+    "Surreal Query Language": {
+      "language_servers": ["surrealql-lsp"],
+      "tab_size": 4
+    }
+  },
+  "lsp": {
+    "surrealql-lsp": {
+      "binary": {
+        "path": "C:\\Users\\User\\.local\\bin\\surrealql-language-server.exe",
+        "arguments": []
+      },
+      "settings": {
+        "version": "v0.5.2"
+      },
+      "initialization_options": {
+        "surrealql": {
+          "connection": {
+            "endpoint": "http://localhost:8000",
+            "namespace": "tie",
+            "database": "payments",
+            "username": "root",
+            "password": "root"
+          },
+          "activeAuthContext": "root",
+          "metadata": {
+            "mode": "both"
+          }
+        }
+      }
+    }
+  }
+}

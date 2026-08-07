@@ -10,7 +10,13 @@
     "typecheck": "bun x tsc --noEmit",
     "lint": "oxlint src",
     "fmt": "oxfmt src",
-    "test": "bun test"
+    "test": "bun test",
+    "db:schema": "surrealkit sync",
+    "db:schema:watch": "surrealkit sync --watch",
+    "db:schema:dry": "surrealkit sync --dry-run",
+    "db:schema:status": "surrealkit status",
+    "db:types": "surrealkit typegen",
+    "db:seed": "surrealkit seed"
   },
   "dependencies": {
     "@surrealdb/better-auth": "0.1.0",

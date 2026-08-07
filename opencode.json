@@ -3,6 +3,24 @@
   "instructions": [
     "AGENTS.md"
   ],
+  "lsp": {
+    "surrealql-lsp": {
+      "command": [
+        "surrealql-language-server"
+      ],
+      "extensions": [
+        ".surql"
+      ],
+      "initialization": {
+        "surrealql": {
+          "activeAuthContext": "root",
+          "metadata": {
+            "mode": "workspace"
+          }
+        }
+      }
+    }
+  },
   "mcp": {
     "surrealdb": {
       "type": "remote",
