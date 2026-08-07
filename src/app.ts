@@ -20,9 +20,14 @@ import { createPaymentsModule } from "./modules/payments";
 import { createInvoicingModule } from "./modules/invoicing";
 import { createWebhooksModule } from "./modules/webhooks";
 import { createCustomizationModule } from "./modules/customization";
+import { createSubscriptionsModule } from "./modules/subscriptions";
+import { createSandboxModule, sandboxProvisioningHook } from "./modules/sandbox";
 
 export function createApp(db: Surreal) {
-  const identityAuth = createAuth(db);
+  // Better Auth identity — sign-up auto-provisions a sandbox merchant + test
+  // keys + mock routing rule (T7). The hook is best-effort: a provisioning
+  // failure logs and never fails the sign-up itself.
+  const identityAuth = createAuth(db, { onUserCreated: sandboxProvisioningHook(db) });
   const identity = createIdentity(identityAuth);
   const sessionAuth = createSessionAuth(identityAuth);
 
@@ -41,7 +46,8 @@ export function createApp(db: Surreal) {
     .use(createPaymentsModule(db))
     .use(createInvoicingModule(db))
     .use(createWebhooksModule(db))
-    .use(createCustomizationModule(db));
+    .use(createCustomizationModule(db))
+    .use(createSubscriptionsModule(db));
   // Pillars to land with their tickets, mounted on the same versioned router:
   //   .use(subscriptions) (T06)
 
@@ -54,12 +60,19 @@ export function createApp(db: Surreal) {
       session: session.id,
     }));
 
-  return new Elysia()
-    .use(errorHandling)
-    .get("/health", () => ({ status: "ok" }))
-    .use(v1)
-    .use(consoleRoutes)
-    .use(identity);
+  return (
+    new Elysia()
+      .use(errorHandling)
+      .get("/health", () => ({ status: "ok" }))
+      .use(v1)
+      // Sandbox mounts OUTSIDE the `/v1` API-key router: its portal routes
+      // (/v1/sandbox/onboarding, /mock/3ds) are session-authenticated, so the
+      // API-key derive on `/v1` must not gate them. Its machine routes
+      // (/v1/sandbox/test_pay*) carry their own API-key derive internally.
+      .use(createSandboxModule(db, { auth: identityAuth }))
+      .use(consoleRoutes)
+      .use(identity)
+  );
 }
 
 export const app = createApp(await getDb());

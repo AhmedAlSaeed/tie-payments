@@ -120,6 +120,22 @@ export const InvoiceResource = t.Object({
 });
 export type InvoiceResource = Static<typeof InvoiceResource>;
 
+/**
+ * Body for POST /invoices/:id/charge — collect money on an OPEN invoice
+ * (T2 collection). `method` is a unified token (`tok_…`; the mock matrix drives
+ * the outcome: 4242 success, 0002 decline, 9999 timeout, 3D01 3DS, QR). `amount`
+ * (minor units) defaults to the invoice's remaining balance; an `amount` above
+ * the remaining balance overpays and moves the excess to the customer's credit
+ * balance (T05).
+ */
+export const ChargeInvoice = t.Object({
+  /** Unified payment-method token (`tok_…`), e.g. `tok_mock_4242`. */
+  method: t.String({ pattern: "^tok_" }),
+  /** Minor units to collect; defaults to `amount_remaining`. Overpay → credit. */
+  amount: t.Optional(t.Integer({ minimum: 1 })),
+});
+export type ChargeInvoice = Static<typeof ChargeInvoice>;
+
 /** Body for PATCH — partial edits on DRAFT invoices (whole-array replaces). */
 export const UpdateInvoice = t.Object({
   customer: t.Optional(t.String({ maxLength: 128 })),

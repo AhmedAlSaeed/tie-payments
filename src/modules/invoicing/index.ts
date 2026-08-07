@@ -19,8 +19,12 @@ import type { Surreal } from "surrealdb";
 import { createContextAuth } from "../../core/context";
 import type { MerchantContext } from "../../core/context";
 import { namespaceIdempotencyKey, SurrealIdempotencyStore, problem } from "../../core/idempotency";
-import { CreateInvoice, InvoiceResource, UpdateInvoice } from "./model";
-import { InvoiceService } from "./service";
+import { GatewayError } from "../../core/gateway";
+import { PaymentService } from "../payments/service";
+import { PaymentsRepository } from "../payments/repository";
+import { routeDriver } from "../payments";
+import { ChargeInvoice, CreateInvoice, InvoiceResource, UpdateInvoice } from "./model";
+import { InvoiceService, type ChargeViaGateway } from "./service";
 import { InvoiceRepository } from "./repository";
 import { ensureDefaultTaxRate } from "./seed";
 
@@ -39,7 +43,40 @@ export function createInvoicingModule(db: Surreal) {
     };
   };
 
-  const service = new InvoiceService(repository, seedTaxRate);
+  // T2 collection: charge through the same routed-gateway seam as the payments
+  // pillar (T03). `routeDriver` picks the mock in sandbox; `PaymentService`
+  // persists the `payment` row and normalizes the outcome.
+  const paymentsRepository = new PaymentsRepository(db);
+  const paymentService = new PaymentService(paymentsRepository);
+  const chargeGateway: ChargeViaGateway = async ({ ctx, method, amountMinor, currency }) => {
+    const gateway = routeDriver(ctx.environment, currency, amountMinor, method);
+    try {
+      const payment = await paymentService.createPayment(
+        ctx,
+        {
+          amountMinor,
+          currency: currency as "BHD" | "USD" | "SAR" | "AED" | "KWD" | "QAR" | "OMR",
+          method,
+        },
+        gateway,
+      );
+      return payment.status === "requires_action"
+        ? { kind: "requires_action", status: payment.status, action: payment.action }
+        : { kind: "succeeded", status: payment.status };
+    } catch (error) {
+      if (error instanceof GatewayError) {
+        return {
+          kind: "gateway_error",
+          code: error.code,
+          retryable: error.retryable,
+          message: error.message,
+        };
+      }
+      throw error;
+    }
+  };
+
+  const service = new InvoiceService(repository, seedTaxRate, chargeGateway);
 
   return new Elysia({ name: "modules.invoicing", prefix: "/invoices" })
     .state("invoiceIdempotencyStore", idempotencyStore)
@@ -129,6 +166,30 @@ export function createInvoicingModule(db: Surreal) {
       { params: t.Object({ id: t.String() }), response: InvoiceResource },
       async ({ params, merchantId, environment, role, scopes, traceId }) => {
         return service.finalize({ merchantId, environment, role, scopes, traceId }, params.id);
+      },
+    )
+    .post(
+      "/:id/charge",
+      { params: t.Object({ id: t.String() }), body: ChargeInvoice, response: InvoiceResource },
+      async ({ params, body, merchantId, environment, role, scopes, traceId }) => {
+        return service.charge({ merchantId, environment, role, scopes, traceId }, params.id, body);
+      },
+    )
+    .post(
+      "/:id/void",
+      { params: t.Object({ id: t.String() }), response: InvoiceResource },
+      async ({ params, merchantId, environment, role, scopes, traceId }) => {
+        return service.voidInvoice({ merchantId, environment, role, scopes, traceId }, params.id);
+      },
+    )
+    .post(
+      "/:id/mark_uncollectible",
+      { params: t.Object({ id: t.String() }), response: InvoiceResource },
+      async ({ params, merchantId, environment, role, scopes, traceId }) => {
+        return service.markUncollectible(
+          { merchantId, environment, role, scopes, traceId },
+          params.id,
+        );
       },
     );
 }

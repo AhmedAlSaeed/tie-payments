@@ -143,6 +143,109 @@ export class InvoiceRepository {
     );
   }
 
+  /**
+   * Read the customer's credit balance (T05 overpay sink). Scoped to
+   * merchant + environment; unresolved customer → undefined (treated as 0).
+   */
+  async findCustomerCredit(
+    merchantId: string,
+    environment: string,
+    customerId: string,
+  ): Promise<number | undefined> {
+    const [rows] = await this.db
+      .query(
+        "SELECT credit_balance FROM customer WHERE id = type::record('customer', $id) AND merchant = $merchant AND environment = $environment LIMIT 1",
+        { id: customerId, merchant: recordIdOf(merchantId), environment },
+      )
+      .collect<[Array<{ credit_balance?: unknown }>]>();
+    const row = rows?.[0];
+    return row ? Number(row.credit_balance) : undefined;
+  }
+
+  /**
+   * Apply a state transition + `outbox_event` in ONE transaction. Mirrors
+   * the T01 in-tx pattern of create/finalize: the invoice row (money bucket
+   * updates `amount_due`/`amount_paid`/`amount_remaining`/`amount_overpaid`,
+   * `status`, `status_transitions`) is updated and an outbox row inserted
+   * atomically. When `event` is null only the invoice is updated (e.g. a
+   * partial payment that does not close the invoice). Optionally atomically
+   * sets the customer's `credit_balance` (credit application / overpay, T05).
+   */
+  async transition(
+    record: InvoiceRecord,
+    event: OutboxEventData | null,
+    opts?: { customer?: { id: string; creditBalance: number } },
+  ): Promise<void> {
+    const customerStmt = opts?.customer
+      ? `UPDATE customer SET credit_balance = $customerCredit
+         WHERE id = type::record('customer', $customerId)
+           AND merchant = $merchant AND environment = $environment;
+      `
+      : "";
+    const outboxStmt = event
+      ? `INSERT INTO outbox_event {
+           merchant: $merchant,
+           environment: $environment,
+           type: $eventType,
+           object_type: "invoice",
+           object_id: $eventObjectId,
+           object: $eventObject,
+           window: time::now()
+         }`
+      : "";
+    await this.db.query(
+      `UPDATE invoice SET
+         amount_due = $amountDue,
+         amount_paid = $amountPaid,
+         amount_remaining = $amountRemaining,
+         amount_overpaid = $amountOverpaid,
+         status = $status,
+         status_transitions = $statusTransitions
+       WHERE id = type::record('invoice', $id)
+         AND merchant = $merchant AND environment = $environment;
+       ${customerStmt}
+       ${outboxStmt}`,
+      {
+        ...this.params(record),
+        customerId: opts?.customer?.id,
+        customerCredit: opts?.customer?.creditBalance,
+        ...(event
+          ? {
+              eventType: event.type,
+              eventObjectId: record.id,
+              eventObject: event.snapshot,
+            }
+          : {}),
+      },
+    );
+  }
+
+  /**
+   * Insert an `outbox_event` WITHOUT changing invoice state — used for the
+   * non-transitional payment outcomes (payment_failed / payment_action_required)
+   * where the invoice stays `open`. Atomic single-statement insert.
+   */
+  async insertEvent(record: InvoiceRecord, event: OutboxEventData): Promise<void> {
+    await this.db.query(
+      `INSERT INTO outbox_event {
+         merchant: $merchant,
+         environment: $environment,
+         type: $eventType,
+         object_type: "invoice",
+         object_id: $eventObjectId,
+         object: $eventObject,
+         window: time::now()
+       }`,
+      {
+        merchant: recordIdOf(record.merchantId),
+        environment: record.environment,
+        eventType: event.type,
+        eventObjectId: record.id,
+        eventObject: event.snapshot,
+      },
+    );
+  }
+
   /** Delete a DRAFT (finalized invoices conflict at the service layer). */
   async deleteDraft(merchantId: string, environment: string, id: string): Promise<boolean> {
     const [rows] = await this.db

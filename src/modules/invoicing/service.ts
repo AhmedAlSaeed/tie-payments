@@ -22,6 +22,7 @@
 import { problem } from "../../core/errors";
 import type { MerchantContext } from "../../core/context";
 import type {
+  ChargeInvoice,
   CreateInvoice,
   CreateInvoiceLineItem,
   InvoiceLineItem,
@@ -37,6 +38,46 @@ export interface InvoiceStore {
   updateDraft(record: InvoiceRecord): Promise<void>;
   deleteDraft(merchantId: string, environment: string, id: string): Promise<boolean>;
   finalize(record: InvoiceRecord, event: OutboxEventData): Promise<void>;
+  findCustomerCredit(
+    merchantId: string,
+    environment: string,
+    customerId: string,
+  ): Promise<number | undefined>;
+  transition(
+    record: InvoiceRecord,
+    event: OutboxEventData | null,
+    opts?: { customer?: { id: string; creditBalance: number } },
+  ): Promise<void>;
+  insertEvent(record: InvoiceRecord, event: OutboxEventData): Promise<void>;
+}
+
+/**
+ * Normalized gateway charge outcome surfaced to the service. The driver seam
+ * (T03) + `PaymentService.createPayment` are injected (pays the payment row and
+ * routes to a driver); the service only sees this closed outcome set.
+ */
+export interface GatewayOutcome {
+  kind: "succeeded" | "requires_action" | "gateway_error";
+  /** Payment resource status when terminal/actionable (`succeeded`/`requires_action`). */
+  status?: string;
+  /** The `action` a payer must perform for `requires_action` (3DS redirect / QR). */
+  action?: { kind: string; [k: string]: unknown };
+  /** Set on `gateway_error`; drives dunning (T06) branching. */
+  retryable?: boolean;
+  code?: string;
+  message?: string;
+}
+
+export type ChargeViaGateway = (input: {
+  ctx: MerchantContext;
+  method: string;
+  amountMinor: number;
+  currency: string;
+}) => Promise<GatewayOutcome>;
+
+interface CustomerCredit {
+  id: string;
+  creditBalance: number;
 }
 
 /** Default per-(merchant, env) tax rate resolver (injected from seed.ts). */
@@ -51,6 +92,7 @@ export class InvoiceService {
   constructor(
     private readonly store: InvoiceStore,
     private readonly seedTaxRate: SeedTaxRate,
+    private readonly chargeGateway: ChargeViaGateway,
   ) {}
 
   async createInvoice(ctx: MerchantContext, body: CreateInvoice): Promise<InvoiceResource> {
@@ -161,6 +203,203 @@ export class InvoiceService {
 
     const refreshed = await this.store.findById(ctx.merchantId, ctx.environment, id);
     return refreshed ? this.toResource(refreshed) : resource;
+  }
+
+  /**
+   * T2 — collect money on an OPEN `charge_automatically` invoice. Applies the
+   * customer's credit balance first (T05), then charges the routed gateway for
+   * the remainder; `succeeded` moves `amount_paid` (+ `paid` at zero, overpay →
+   * credit), `requires_action` and gateway failures keep the invoice `open`.
+   */
+  async charge(ctx: MerchantContext, id: string, body: ChargeInvoice): Promise<InvoiceResource> {
+    const record = await this.store.findById(ctx.merchantId, ctx.environment, id);
+    if (!record) {
+      throw problem("resource_not_found", "Invoice not found.");
+    }
+    if (record.collection_method !== "charge_automatically") {
+      // send_invoice is the HPP / payment-link rail: charged via hosted_invoice_url.
+      throw problem(
+        "conflict",
+        "send_invoice invoices are paid via hosted_invoice_url; direct charges are not allowed.",
+      );
+    }
+    if (record.status !== "open") {
+      throw problem("conflict", "Only open invoices can be charged.");
+    }
+
+    const remaining = record.amount_due - record.amount_paid;
+    if (remaining <= 0) {
+      throw problem("conflict", "Invoice has no remaining balance to charge.");
+    }
+
+    // T05 credit application: reduce the amount charged by the customer's
+    // available credit (never charging more than the requested amount).
+    const creditAvailable = record.customerId
+      ? ((await this.store.findCustomerCredit(
+          ctx.merchantId,
+          ctx.environment,
+          record.customerId,
+        )) ?? 0)
+      : 0;
+    const requested = body.amount ?? remaining;
+    const creditApplied = Math.min(creditAvailable, requested);
+    const gatewayAmount = requested - creditApplied;
+
+    // Entirely covered by credit — settle with no gateway charge.
+    if (gatewayAmount <= 0) {
+      const next = this.applyPaid(record, creditApplied, 0);
+      const resource = this.toResource(next);
+      await this.store.transition(
+        next,
+        { type: "invoice.paid", snapshot: resource },
+        { customer: { id: record.customerId!, creditBalance: creditAvailable - creditApplied } },
+      );
+      return resource;
+    }
+
+    const outcome = await this.chargeGateway({
+      ctx,
+      method: body.method,
+      amountMinor: gatewayAmount,
+      currency: record.currency,
+    });
+
+    if (outcome.kind === "requires_action") {
+      // 3DS / QR sandbox completion lands via a later webhook (T7); here just
+      // persist the payment and surface the action. The invoice stays open.
+      const snapshot = {
+        ...this.toResource(record),
+        payment_action: { kind: outcome.action?.kind, action: outcome.action },
+      } as InvoiceResource;
+      await this.store.insertEvent(record, { type: "invoice.payment_action_required", snapshot });
+      return this.toResource(record);
+    }
+
+    if (outcome.kind === "gateway_error") {
+      const snapshot = {
+        ...this.toResource(record),
+        payment_failure: {
+          retryable: outcome.retryable ?? false,
+          code: outcome.code,
+          message: outcome.message,
+        },
+      } as InvoiceResource;
+      await this.store.insertEvent(record, { type: "invoice.payment_failed", snapshot });
+      return this.toResource(record);
+    }
+
+    // succeeded — move amount_paid; close to `paid` at zero, return overpay to credit.
+    const next = this.applySuccess(record, creditApplied, gatewayAmount);
+    const paidOut = next.status === "paid";
+    const overpayCredit = next.amount_overpaid;
+    const customer: CustomerCredit = {
+      id: record.customerId!,
+      creditBalance: creditAvailable - creditApplied + overpayCredit,
+    };
+    const event: OutboxEventData | null = paidOut
+      ? { type: "invoice.paid", snapshot: this.toResource(next) }
+      : null;
+    await this.store.transition(next, event, { customer });
+    return this.toResource(next);
+  }
+
+  /** T2 — OPEN → voided; sets `voided_at`; emits `invoice.voided`. */
+  async voidInvoice(ctx: MerchantContext, id: string): Promise<InvoiceResource> {
+    const record = await this.requireOpen(ctx, id);
+    const next: InvoiceRecord = {
+      ...record,
+      status: "voided",
+      status_transitions: {
+        ...record.status_transitions,
+        voided_at: new Date().toISOString(),
+      },
+    };
+    await this.store.transition(next, { type: "invoice.voided", snapshot: this.toResource(next) });
+    return this.toResource(next);
+  }
+
+  /** T2 — OPEN → uncollectible; `marked_uncollectible_at`; `invoice.marked_uncollectible`. */
+  async markUncollectible(ctx: MerchantContext, id: string): Promise<InvoiceResource> {
+    const record = await this.requireOpen(ctx, id);
+    const next: InvoiceRecord = {
+      ...record,
+      status: "uncollectible",
+      status_transitions: {
+        ...record.status_transitions,
+        marked_uncollectible_at: new Date().toISOString(),
+      },
+    };
+    await this.store.transition(next, {
+      type: "invoice.marked_uncollectible",
+      snapshot: this.toResource(next),
+    });
+    return this.toResource(next);
+  }
+
+  /** Load an OPEN invoice; 404 when missing, 409 when not open/chargeable. */
+  private async requireOpen(ctx: MerchantContext, id: string): Promise<InvoiceRecord> {
+    const record = await this.store.findById(ctx.merchantId, ctx.environment, id);
+    if (!record) {
+      throw problem("resource_not_found", "Invoice not found.");
+    }
+    if (record.status !== "open") {
+      throw problem("conflict", "Only open invoices can be updated by collection.");
+    }
+    return record;
+  }
+
+  /**
+   * Recompute the money buckets after a successful charge. `creditApplied` was
+   * already deducted from `amount_due` (Stripe credit-application model); the
+   * gateway cash adds to `amount_paid`. `paid` when covered; the excess over
+   * the reduced `amount_due` becomes `amount_overpaid` (returned as customer
+   * credit). `amount_overpaid` is 0 unless the charge overpaid.
+   */
+  private applyPaid(
+    record: InvoiceRecord,
+    creditApplied: number,
+    gatewayAmount: number,
+  ): InvoiceRecord {
+    const amountDue = Math.max(0, record.amount_due - creditApplied);
+    const amountPaid = record.amount_paid + gatewayAmount;
+    const overpaid = Math.max(0, amountPaid - amountDue);
+    const amountRemaining = Math.max(0, amountDue - amountPaid);
+    return {
+      ...record,
+      amount_due: amountDue,
+      amount_paid: amountPaid,
+      amount_remaining: amountRemaining,
+      amount_overpaid: overpaid,
+      status: "paid",
+      status_transitions: {
+        ...record.status_transitions,
+        paid_at: new Date().toISOString(),
+      },
+    };
+  }
+
+  /** `applyPaid` alias kept as the single success-path money mover. */
+  private applySuccess(
+    record: InvoiceRecord,
+    creditApplied: number,
+    gatewayAmount: number,
+  ): InvoiceRecord {
+    const amountDue = Math.max(0, record.amount_due - creditApplied);
+    const amountPaid = record.amount_paid + gatewayAmount;
+    const fullyPaid = amountPaid >= amountDue;
+    const overpaid = fullyPaid ? amountPaid - amountDue : 0;
+    const amountRemaining = fullyPaid ? 0 : amountDue - amountPaid;
+    return {
+      ...record,
+      amount_due: amountDue,
+      amount_paid: amountPaid,
+      amount_remaining: amountRemaining,
+      amount_overpaid: overpaid,
+      status: fullyPaid ? "paid" : "open",
+      status_transitions: fullyPaid
+        ? { ...record.status_transitions, paid_at: new Date().toISOString() }
+        : record.status_transitions,
+    };
   }
 
   /** Compute per-line items + invoice totals for a set of body lines. */
